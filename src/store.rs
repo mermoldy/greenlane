@@ -1,23 +1,16 @@
-//! Authoritative, server-side timeline store.
+//! Shared timeline value types.
 //!
-//! The collector closes one [`Slice`] per greenlet run-interval and pushes it
-//! here. Each viewer holds a cursor (count of slices it has received) and the
-//! server hands it the contiguous tail since that cursor on a fixed timer. This
-//! lossless cursor model replaces a broadcast channel: no per-client lag, no
-//! dropped events, and therefore no expensive full-snapshot resyncs.
-//!
-//! This is also the seam where server-side LOD will live: today `delta()`
-//! returns raw slices (fat-client v1); a future `query(viewport)` will return
-//! per-pixel aggregates so the wire and the browser stay bounded by the screen.
+//! These are the unit of data everywhere: parsed off the wire in the collector,
+//! ingested into the DuckDB-backed [`Db`](crate::db::Db), serialized into `.glr`
+//! recordings, and sent to the viewer. The authoritative store is now the
+//! embedded database (see `db.rs`); this module only holds the value types.
 
-use std::sync::{Arc, Mutex};
-
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// One greenlet run-interval: it ran from `start` for `dur` nanoseconds
 /// (both relative to the bootstrap's `t0`).
-#[derive(Clone, Serialize)]
-pub struct Slice {
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Execution {
     /// Stable greenlet identity (Python `id()` of the object).
     pub gid: u64,
     /// Start time in ns since the trace began.
@@ -35,7 +28,7 @@ pub struct Slice {
 }
 
 /// A garbage-collection pause: a global stall of the whole gevent thread.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct GcEvent {
     /// Start time in ns since the trace began.
     pub start: u64,
@@ -46,55 +39,4 @@ pub struct GcEvent {
     pub generation: i64,
     /// Objects collected.
     pub collected: i64,
-}
-
-pub struct Store {
-    slices: Mutex<Vec<Slice>>,
-    gc: Mutex<Vec<GcEvent>>,
-    /// Wall-clock epoch (ms) corresponding to trace t0, for absolute time modes.
-    epoch_ms: Mutex<Option<u64>>,
-}
-
-impl Store {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            slices: Mutex::new(Vec::new()),
-            gc: Mutex::new(Vec::new()),
-            epoch_ms: Mutex::new(None),
-        })
-    }
-
-    /// Append a closed slice.
-    pub fn push(&self, slice: Slice) {
-        self.slices.lock().unwrap().push(slice);
-    }
-
-    pub fn push_gc(&self, ev: GcEvent) {
-        self.gc.lock().unwrap().push(ev);
-    }
-
-    /// GC events appended since `cursor`, plus the new cursor.
-    pub fn gc_delta(&self, cursor: usize) -> (Vec<GcEvent>, usize) {
-        let g = self.gc.lock().unwrap();
-        let len = g.len();
-        let batch = if cursor < len { g[cursor..].to_vec() } else { Vec::new() };
-        (batch, len)
-    }
-
-    pub fn set_epoch(&self, ms: u64) {
-        *self.epoch_ms.lock().unwrap() = Some(ms);
-    }
-
-    pub fn epoch(&self) -> Option<u64> {
-        *self.epoch_ms.lock().unwrap()
-    }
-
-    /// The slices appended since `cursor`, plus the new cursor (current length).
-    /// Clones only the tail, so steady-state cost is proportional to new data.
-    pub fn delta(&self, cursor: usize) -> (Vec<Slice>, usize) {
-        let g = self.slices.lock().unwrap();
-        let len = g.len();
-        let batch = if cursor < len { g[cursor..].to_vec() } else { Vec::new() };
-        (batch, len)
-    }
 }

@@ -1,0 +1,79 @@
+name: CI/CD Check
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build-test-lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python dependencies
+        run: uv sync --locked --dev
+
+      - name: Install viewer dependencies
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      - name: Run pre-commit
+        run: uv run pre-commit run --all-files
+
+      - name: Check Python lint
+        run: uv run ruff check
+
+      - name: Check Python formatting
+        run: uv run ruff format --check
+
+      - name: Check Python types
+        run: >
+          uv run ty check
+          --output-format github
+          --no-progress
+          --ignore invalid-assignment
+          --ignore unresolved-attribute
+
+      - name: Check TypeScript types
+        working-directory: web
+        run: bun run typecheck
+
+      - name: Test Python
+        run: uv run pytest
+
+      - name: Test TypeScript
+        working-directory: web
+        run: bun run test
+
+      - name: Build viewer
+        working-directory: web
+        run: bun run build
+
+      - name: Test Rust
+        run: cargo test --locked
+
+      - name: Build binary
+        run: cargo build --locked

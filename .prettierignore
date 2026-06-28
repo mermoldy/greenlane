@@ -1,0 +1,9 @@
+target/
+web/dist/
+web/node_modules/
+.venv/
+*.glr
+
+Cargo.lock
+uv.lock
+web/bun.lock

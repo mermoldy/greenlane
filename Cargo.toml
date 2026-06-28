@@ -2,14 +2,40 @@
 name = "greenlane"
 version = "0.1.0"
 edition = "2024"
+description = "A microscope for gevent applications: a live timeline profiler that attaches to a running Python process and visualizes scheduler activity, GC pauses, and call stacks."
+authors = ["Serhii Babak"]
+license = "MIT"
+repository = "https://github.com/mermoldy/greenlane"
+homepage = "https://github.com/mermoldy/greenlane"
+readme = "README.md"
+keywords = ["gevent", "profiler", "greenlet", "tracing"]
+categories = ["development-tools::profiling", "development-tools::debugging"]
+# web/dist/* is git-ignored (built by `bun run build`), so it is excluded from
+# the package by default. rust-embed needs those assets at compile time, so list
+# what to ship explicitly — build the viewer (`make web`) before `cargo publish`.
+# Patterns are gitignore-style: anchor root-level files with a leading `/` so a
+# bare name doesn't also match e.g. node_modules/**/README.md.
+include = [
+    "/src/**/*",
+    "/web/dist/**/*",
+    "/README.md",
+    "/LICENSE",
+]
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 ctrlc = "3"
+libc = "0.2"
+# Pure-Rust DEFLATE backend (miniz_oxide) — no C dep, links cleanly with musl —
+# for compressing sealed .glr segments (R7).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.7", features = ["fs", "cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rust-embed = "8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+polars = { version = "0.54.4", default-features = false, features = ["lazy"] }

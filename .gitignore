@@ -1,1 +1,33 @@
+# ── Rust ────────────────────────────────────────────────
 /target
+**/*.rs.bk
+
+# ── Node / web (bun + vite) ─────────────────────────────
+node_modules/
+web/node_modules/
+# Built viewer bundle is a build artifact; keep the dir (rust-embed needs it
+# to exist at compile time) but ignore its contents — `bun run build` repopulates.
+web/dist/*
+!web/dist/.gitkeep
+*.tsbuildinfo
+bun-debug.log*
+npm-debug.log*
+yarn-error.log*
+
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ── OS / editor / env ───────────────────────────────────
+.DS_Store
+*.swp
+.idea/
+.vscode/
+.env

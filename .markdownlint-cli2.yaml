@@ -1,0 +1,21 @@
+config:
+  default: true
+  MD013: false
+  MD033: false
+  MD041: false
+  # Allow repeated heading text under different parents (e.g. per-item
+  # "Motivation"/"Steps"/"Notes" subsections in design docs); still flags true
+  # duplicate sibling headings.
+  MD024:
+    siblings_only: true
+  # Table column alignment is owned by prettier, which leaves wide tables
+  # unaligned (it respects print width); MD060 would conflict with that.
+  MD060: false
+
+globs:
+  - "**/*.md"
+ignores:
+  - "target/**"
+  - "web/dist/**"
+  - "web/node_modules/**"
+  - ".venv/**"

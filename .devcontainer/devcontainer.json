@@ -1,0 +1,38 @@
+{
+  "name": "greenlane-linux",
+  "build": { "dockerfile": "Dockerfile" },
+
+  // node is needed to run the prettier / markdownlint-cli2 binaries `bun install`
+  // drops into web/node_modules/.bin (their shebang is `node`).
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "22" }
+  },
+
+  // The whole point of this container: reaching into another process.
+  // `sys.remote_exec` (PEP 768) attaches over ptrace, so the container needs the
+  // SYS_PTRACE capability and an unconfined seccomp profile. Run greenlane with
+  // `sudo` inside the container (root bypasses Yama ptrace_scope), exactly like
+  // the README's Linux instructions. Bump to "privileged": true if/when you test
+  // perf_event_open off-CPU/CPU sampling (it also wants relaxed perf_event_paranoid).
+  "runArgs": ["--cap-add=SYS_PTRACE", "--security-opt", "seccomp=unconfined"],
+
+  // One-time setup: fetch CPython 3.14, sync the dev dependency group, and install
+  // the viewer's node deps. Runs as the `vscode` user so the toolchains land in
+  // its home.
+  "postCreateCommand": "uv python install 3.14 && uv sync --dev && bun install --cwd web",
+
+  "remoteUser": "vscode",
+
+  // `vscode` here is the IDE/tool key (where VS Code reads its extensions), NOT a
+  // username. The terminal-first `dev` CLI ignores this block.
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "ms-python.python",
+        "charliermarsh.ruff"
+      ]
+    }
+  }
+}
