@@ -3,7 +3,7 @@ import react from "@vitejs/plugin-react";
 
 // Built assets land in web/dist, which the Rust binary embeds via rust-embed.
 // `base: "./"` keeps asset URLs relative so they resolve when served from the
-// embedded root. During `bun run dev`, /ws is proxied to the greenhub backend.
+// embedded root. During `bun run dev`, /ws is proxied to the greenline backend.
 export default defineConfig({
   plugins: [react()],
   base: "./",

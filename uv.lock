@@ -52,7 +52,7 @@ wheels = [
 ]
 
 [[package]]
-name = "greenhub"
+name = "greenline"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

@@ -12,4 +12,5 @@ axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.7", features = ["fs", "cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+postcard = { version = "1", features = ["alloc"] }
 rust-embed = "8"

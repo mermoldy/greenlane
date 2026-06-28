@@ -995,7 +995,7 @@ export class Timeline {
       } else {
         // scroll the greenlet list vertically (keeps follow on); only a
         // horizontal-DOMINANT wheel pans time and cancels follow.
-        const dy = e.deltaMode === 1 ? e.deltaY * this.trackH * 3 : e.deltaY * 5;
+        const dy = e.deltaMode === 1 ? e.deltaY * this.trackH * 3 : e.deltaY * 14;
         this.scrollY = Math.max(0, Math.min(this.maxScrollY(), this.scrollY + dy));
         if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
           this.viewT0 += e.deltaX / this.pxPerMs;
