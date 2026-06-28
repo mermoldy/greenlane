@@ -1,8 +1,8 @@
 # greenlane bootstrap (asyncio variant) — injected into a live asyncio process
-# via sys.remote_exec (PEP 768, CPython 3.14+). It reproduces the gevent
-# bootstrap's wire protocol exactly, so the Rust collector, the slice store and
-# the web viewer need *no* changes: it streams the same tab-delimited
-# "switch"/"gc"/"meta" lines over a Unix STREAM socket.
+# via sys.remote_exec (PEP 768, CPython 3.14+). It emits the same binary trace
+# format as the gevent bootstrap (ADR 0001; encoder inlined from src/glr.py), so
+# the Rust collector, the slice store and the web viewer need *no* asyncio-specific
+# handling — it streams `switch`/`gc`/`meta` frames over a Unix STREAM socket.
 #
 # ── The model ─────────────────────────────────────────────────────────────────
 # gevent gives us a single, clean hook (`greenlet.settrace`) that fires on every
@@ -47,6 +47,7 @@
 import _socket
 import gc
 import sys
+import threading
 import time
 
 try:
@@ -55,10 +56,45 @@ except Exception:
     asyncio = None
 
 _GH_SOCK_PATH = "__SOCKET_PATH__"
+# Full call-stack capture mode (greenlane --include-traces): 0 off, 1 slow, 2 all.
+# Walking the await chain is the expensive hot-path step, so it runs when a task
+# STEP ends (its duration known) on the task that just suspended: `all` walks every
+# step, `slow` only steps at/over the warn threshold, `off` never. Every step still
+# gets a cheap leaf-function label. sys.monitoring fires on the hot path, so this
+# gating matters as much as it does for the gevent hook.
+_GH_MODE = __TRACE_MODE__
+# Warn threshold (ns) — the slow/fast cutoff for `slow` mode. Matches --warn-ms.
+_GH_WARN_NS = __WARN_NS__
 
 # Synthetic identity for the event loop. Real id() values are addresses and are
 # never this small, so 1 can't collide with a real Task.
 _LOOP_ID = 1
+
+
+# ── binary trace encoder (inlined from src/glr.py) ──────────────────────────
+# __GLR_ENCODER__
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _pyinfo_json(runtime):
+    """Interpreter/runtime facts for the viewer's System panel (best-effort)."""
+    import json
+    import os
+    import platform
+
+    info = {
+        "runtime": runtime,
+        "python": platform.python_version(),
+        "implementation": platform.python_implementation(),
+        "executable": sys.executable,
+        "pid": os.getpid(),
+        "thread": threading.current_thread().name,
+        "platform": sys.platform,
+    }
+    try:
+        return json.dumps(info)
+    except Exception:
+        return "{}"
 
 
 def _greenlane_install():
@@ -86,21 +122,99 @@ def _greenlane_install():
 
     sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
     sock.connect(_GH_SOCK_PATH)
+    # Bound how long a send may block the target: if greenlane stalls or goes
+    # away, the next flush raises instead of hanging the profiled event loop.
+    sock.settimeout(5.0)
 
     t0 = time.perf_counter_ns()
+    import os
 
-    # Header: wall-clock epoch (ms) at t0, so the viewer can show absolute time.
-    try:
-        sock.sendall(b"meta\t%d\n" % int(time.time() * 1000))
-    except OSError:
-        pass
+    # Send buffer + binary encoder. Task steps are extremely hot, so instead of one
+    # sendall per step we append encoded frames here and flush in batches once the
+    # buffer crosses _FLUSH_BYTES (or _FLUSH_NS of wall time passes, so a low-rate
+    # loop still delivers promptly). sys.monitoring is interpreter-global and fires
+    # on every thread, so a lock guards BOTH the buffer and the encoder's pools when
+    # several event loops run on different threads; it's uncontended (and cheap) in
+    # the common single-loop case.
+    _buf = bytearray()
+    enc = GlrEnc(_buf)  # writes the stream header into _buf
+    _FLUSH_BYTES = 16384
+    _FLUSH_NS = 50_000_000  # 50ms
+    _last_flush = [0]
+    _lock = threading.Lock()
+
+    def _flush(now_ns):
+        # Returns False if greenlane went away (caller tears the hook down).
+        # Must be called WITHOUT _lock held (it takes it to snapshot).
+        _last_flush[0] = now_ns
+        # Snapshot + clear under the lock BEFORE the blocking send: sendall releases
+        # the GIL, and clearing only what we snapshotted means a concurrent append
+        # from another loop thread is preserved for the next flush, not dropped.
+        with _lock:
+            if not _buf:
+                return True
+            chunk = bytes(_buf)
+            del _buf[:]
+        try:
+            sock.sendall(chunk)
+        except OSError:
+            return False
+        return True
+
+    # Schemas (switch + gc) and the meta frame (epoch wall-clock, loop tid, pid,
+    # interpreter facts) — one-time, sent before any events on this install thread.
+    enc.write_wire_schemas()
+    enc.meta(
+        int(time.time() * 1000), threading.get_native_id(), os.getpid(), _pyinfo_json("asyncio")
+    )
+    _flush(0)
 
     _LIB = ("/asyncio/", "/greenlane")  # library frames (kept, but flagged)
 
-    # The "unit" (task id) currently considered running. Starts on the Loop.
-    _running = [_LOOP_ID]
-    # Guard against a callback re-entering us (it shouldn't, but be safe).
-    _in_cb = [False]
+    # Per-thread state. sys.monitoring is interpreter-global (fires on every
+    # thread), but each event loop runs on its own thread with its own
+    # current_task(), so the "currently running unit" and the OS thread id must be
+    # tracked per thread — a single shared value would let one loop's step close
+    # another loop's span. The collector keys its run-intervals by the emitted
+    # thread id for the same reason.
+    _tls = threading.local()
+
+    def _running_get():
+        try:
+            return _tls.running
+        except AttributeError:
+            _tls.running = _LOOP_ID
+            return _LOOP_ID
+
+    def _running_set(v):
+        _tls.running = v
+
+    def _tid():
+        try:
+            return _tls.tid
+        except AttributeError:
+            _tls.tid = threading.get_native_id()
+            return _tls.tid
+
+    def _in_cb_get():
+        return getattr(_tls, "in_cb", False)
+
+    def _in_cb_set(v):
+        _tls.in_cb = v
+
+    def _running_task_get():
+        # The Task object currently running on this thread (None when on the Loop) —
+        # kept so we can walk its yield point when its step CLOSES.
+        return getattr(_tls, "running_task", None)
+
+    def _running_task_set(v):
+        _tls.running_task = v
+
+    def _step_start_get():
+        return getattr(_tls, "step_start", 0)
+
+    def _step_start_set(v):
+        _tls.step_start = v
 
     def _coro_frame(obj):
         # The frame of a coroutine / async-gen / generator, if it has one.
@@ -142,22 +256,36 @@ def _greenlane_install():
         out.reverse()  # leaf -> root, same as walking f_back in the gevent hook
         return out
 
-    def _headline(frames):
-        # Compact label = first application frame (basename), skipping library.
-        for fr in frames:
-            path = fr.rsplit(":", 2)[0]
-            if not any(s in path for s in _LIB):
-                base, _, rest = fr.rpartition("/")
-                return rest if base else fr
-        if frames:
-            _, _, rest = frames[0].rpartition("/")
-            return rest or frames[0]
-        return ""
+    def _task_func_cheap(task, limit=32):
+        # Cheap leaf label when full traces are off: walk the await chain but only
+        # remember the deepest application frame (where the coroutine actually is),
+        # formatted as one "basename:qualname:lineno". Avoids building + reversing +
+        # joining the whole chain on every task step.
+        try:
+            obj = task.get_coro()
+        except Exception:
+            return ""
+        leaf_app = ""
+        leaf_any = ""
+        seen = 0
+        while obj is not None and seen < limit:
+            fr = _coro_frame(obj)
+            if fr is not None:
+                co = fr.f_code
+                fn = co.co_filename
+                if "greenlane-bootstrap" not in fn:
+                    ent = "%s:%s:%d" % (fn.rpartition("/")[2], co.co_qualname, fr.f_lineno)
+                    leaf_any = ent
+                    if not any(s in fn for s in _LIB):
+                        leaf_app = ent
+            obj = _coro_await(obj)
+            seen += 1
+        return leaf_app or leaf_any
 
     def _task_label(task):
         # A whitespace-free identity. Tasks carry a name (auto "Task-N" or the
         # app-supplied name passed to create_task(..., name=...)); we sanitise
-        # whitespace so it survives the tab-delimited protocol.
+        # whitespace to keep labels compact and consistent with the gevent side.
         try:
             name = task.get_name()
         except Exception:
@@ -173,51 +301,65 @@ def _greenlane_install():
                 return str(v).replace("\t", " ").replace("\n", " ")
         return ""
 
-    def _send_switch(event, origin_id, target_id, label, func, corr, stack):
-        # Same field order/semantics as the gevent bootstrap. The collector
-        # attaches label/func/task/stack to the *target* (opening) span.
-        #   t_ns \t event \t origin \t target \t label \t func \t task \t stack
-        line = "%d\t%s\t%d\t%d\t%s\t%s\t%s\t%s\n" % (
-            time.perf_counter_ns() - t0,
-            event,
-            origin_id,
-            target_id,
-            label,
-            func,
-            corr,
-            stack,
-        )
-        try:
-            sock.sendall(line.encode())
-            return True
-        except OSError:
+    def _emit(now, target_id, label, func, corr, closing_task):
+        # Encode one switch: `func`/`label` describe the OPENING span (target); the
+        # full `stack` describes the CLOSING span — the task that just suspended
+        # (`closing_task`, None for the Loop). The collector attaches func to the
+        # opener and stack to the closer. Walking the closing task's await chain
+        # happens only when the mode (and, for `slow`, its step duration) calls for
+        # it — that's what keeps `slow` cheap. The build runs under _lock so the
+        # encoder pools + buffer stay consistent across loop threads.
+        stack_frames = ()
+        if closing_task is not None:
+            if _GH_MODE == 2:  # all
+                stack_frames = _task_frames(closing_task)
+            elif _GH_MODE == 1:  # slow
+                if now - _step_start_get() >= _GH_WARN_NS:
+                    stack_frames = _task_frames(closing_task)
+        with _lock:
+            enc.switch(
+                now,
+                target_id,
+                enc.str_id(label),
+                enc.str_id(func),
+                enc.str_id(corr),
+                enc.stack_id(stack_frames),
+                _tid(),
+            )
+            over = len(_buf) >= _FLUSH_BYTES or now - _last_flush[0] >= _FLUSH_NS
+        if over and not _flush(now):
             _teardown()
-            return False
 
-    def _switch_to_task(task, event):
-        # A task step is beginning: close the Loop's slice, open the task's.
+    def _switch_to_task(task):
+        # A task step is beginning: close the current span (the Loop, normally),
+        # open the task's. The task's full stack is captured later, when its step
+        # ends (_switch_to_loop). Here we record only its cheap resume leaf.
         tid = id(task)
-        if tid == _running[0]:
+        if tid == _running_get():
             return
-        frames = _task_frames(task)
-        label = _task_label(task)
-        _send_switch(
-            event,
-            _running[0],
+        now = time.perf_counter_ns() - t0
+        _emit(
+            now,
             tid,
-            label,
-            _headline(frames),
+            _task_label(task),
+            _task_func_cheap(task),
             _task_corr(task),
-            " <- ".join(frames),
+            _running_task_get(),
         )
-        _running[0] = tid
+        _running_set(tid)
+        _running_task_set(task)
+        _step_start_set(now)
 
     def _switch_to_loop():
-        # The running task step just ended: close its slice, open the Loop's.
-        if _running[0] == _LOOP_ID:
+        # The running task step just ended: close the task's slice (walking its
+        # yield point if it was slow / mode=all), open the Loop's.
+        if _running_get() == _LOOP_ID:
             return
-        _send_switch("switch", _running[0], _LOOP_ID, "Loop", "", "", "")
-        _running[0] = _LOOP_ID
+        now = time.perf_counter_ns() - t0
+        _emit(now, _LOOP_ID, "Loop", "", "", _running_task_get())
+        _running_set(_LOOP_ID)
+        _running_task_set(None)
+        _step_start_set(now)
 
     def _current_task():
         try:
@@ -225,30 +367,45 @@ def _greenlane_install():
         except RuntimeError:
             return None  # no running loop on this thread
 
+    # CO_COROUTINE flag on a code object (its frames are coroutine steps).
+    _CO_COROUTINE = 0x0080
+
     # ── monitoring callbacks ──────────────────────────────────────────────────
     # PY_RESUME/PY_THROW: a coroutine is resuming. If current_task() differs from
     # who we think is running, a new task step has begun.
     def _on_resume(code, offset):
-        if _in_cb[0]:
+        if _in_cb_get():
             return
         task = _current_task()
-        if task is not None and id(task) != _running[0]:
-            _in_cb[0] = True
+        if task is not None and id(task) != _running_get():
+            _in_cb_set(True)
             try:
-                _switch_to_task(task, "switch")
+                _switch_to_task(task)
             finally:
-                _in_cb[0] = False
+                _in_cb_set(False)
+
+    # PY_START fires when a code object begins — including a task coroutine's FIRST
+    # step (which is a start, not a resume), so without this a task that runs a long
+    # first step before its first await — e.g. a CPU-bound task — would be
+    # mis-attributed to the Loop. PY_START also fires for ordinary function calls,
+    # so we return monitoring.DISABLE for non-coroutine code: the interpreter then
+    # stops calling us for that code object, leaving only coroutine starts after a
+    # brief warmup (cheap). Coroutine starts route to the same task-step logic.
+    def _on_start(code, offset):
+        if not (code.co_flags & _CO_COROUTINE):
+            return mon.DISABLE
+        _on_resume(code, offset)
 
     def _on_throw(code, offset, exc):
-        if _in_cb[0]:
+        if _in_cb_get():
             return
         task = _current_task()
-        if task is not None and id(task) != _running[0]:
-            _in_cb[0] = True
+        if task is not None and id(task) != _running_get():
+            _in_cb_set(True)
             try:
-                _switch_to_task(task, "throw")
+                _switch_to_task(task)
             finally:
-                _in_cb[0] = False
+                _in_cb_set(False)
 
     # PY_YIELD/PY_RETURN/PY_UNWIND on a *top-level* coroutine frame marks the end
     # of a step: control is about to return to the loop. A task's top coroutine
@@ -257,16 +414,17 @@ def _greenlane_install():
     # or None (uvloop's C driver, or an eagerly-started task). Nested awaited
     # coroutines have an ordinary Python parent and are ignored.
     def _on_suspend(code, offset, *rest):
-        if _in_cb[0] or _running[0] == _LOOP_ID:
+        if _in_cb_get() or _running_get() == _LOOP_ID:
             return
         parent = sys._getframe(1).f_back  # caller of the coroutine raising this
         if parent is None or parent.f_code.co_qualname == "Handle._run":
-            _in_cb[0] = True
+            _in_cb_set(True)
             try:
                 _switch_to_loop()
             finally:
-                _in_cb[0] = False
+                _in_cb_set(False)
 
+    mon.register_callback(tool_id, E.PY_START, _on_start)
     mon.register_callback(tool_id, E.PY_RESUME, _on_resume)
     mon.register_callback(tool_id, E.PY_THROW, _on_throw)
     mon.register_callback(tool_id, E.PY_YIELD, _on_suspend)
@@ -274,7 +432,7 @@ def _greenlane_install():
     mon.register_callback(tool_id, E.PY_UNWIND, _on_suspend)
     mon.set_events(
         tool_id,
-        E.PY_RESUME | E.PY_THROW | E.PY_YIELD | E.PY_RETURN | E.PY_UNWIND,
+        E.PY_START | E.PY_RESUME | E.PY_THROW | E.PY_YIELD | E.PY_RETURN | E.PY_UNWIND,
     )
 
     # ── GC tracking ─────────────────────────────────────────────────────────
@@ -286,29 +444,34 @@ def _greenlane_install():
         if phase == "start":
             _gc_start[0] = time.perf_counter_ns()
         elif phase == "stop":
+            if _gc_start[0] == 0:
+                return  # "stop" without a matching "start" (installed mid-collection)
             now = time.perf_counter_ns()
-            line = "gc\t%d\t%d\t%d\t%d\n" % (
-                _gc_start[0] - t0,
-                now - _gc_start[0],
-                info.get("generation", -1),
-                info.get("collected", 0),
-            )
-            try:
-                sock.sendall(line.encode())
-            except OSError:
-                try:
-                    gc.callbacks.remove(_gc_cb)
-                except ValueError:
-                    pass
+            start = _gc_start[0] - t0
+            if start < 0:
+                start = 0
+            with _lock:
+                enc.gc(
+                    start, now - _gc_start[0], info.get("generation", -1), info.get("collected", 0)
+                )
+            # GC marks a stall worth delivering promptly, so flush right after.
+            if not _flush(now - t0):
+                _teardown()  # greenlane gone: stop tracking
 
     gc.callbacks.append(_gc_cb)
 
     def _teardown():
         # greenlane went away (exit / detach): stop paying the monitoring cost
         # and detach cleanly so the target is left exactly as we found it.
+        # Best-effort final flush first so a clean detach doesn't drop buffered
+        # events (a no-op / harmless failure when the socket is already gone).
+        try:
+            _flush(time.perf_counter_ns() - t0)
+        except Exception:
+            pass
         try:
             mon.set_events(tool_id, mon.events.NO_EVENTS)
-            for ev in (E.PY_RESUME, E.PY_THROW, E.PY_YIELD, E.PY_RETURN, E.PY_UNWIND):
+            for ev in (E.PY_START, E.PY_RESUME, E.PY_THROW, E.PY_YIELD, E.PY_RETURN, E.PY_UNWIND):
                 mon.register_callback(tool_id, ev, None)
             mon.free_tool_id(tool_id)
         except Exception:

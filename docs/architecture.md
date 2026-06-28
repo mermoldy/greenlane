@@ -31,16 +31,31 @@ flowchart LR
     COL --> ST
     ST -->|"--serve"| SRV
     ST -->|"default"| GLR
-    SRV -->|"live deltas"| BR
+    SRV -->|"binary window replies"| BR
     GLR -.->|"greenlane open"| SRV
 ```
 
 ## The event pipeline
 
 The runtime bootstrap registers the scheduler hook that fits the target:
-`greenlet.settrace` for gevent, or `sys.monitoring` coroutine resume/yield events
-for asyncio. Both variants also attach a `gc.callbacks` handler, then write the
-same tab-delimited event stream to a Unix socket. Because the hook runs on the
+`greenlet.settrace` for gevent, or `sys.monitoring` coroutine start/resume/yield
+events for asyncio (it watches `PY_START` as well as `PY_RESUME` so a task's
+_first_ step — e.g. a CPU-bound task that never awaited — is attributed to the
+task, not the loop; non-coroutine `PY_START`s are disabled via `monitoring.DISABLE`
+to stay cheap). Both variants also attach a `gc.callbacks` handler, then write the
+same **binary framed event stream** to a Unix socket (ADR 0001): self-describing
+schema'd frames, interned string + stack pools so a repeated call stack is sent
+once, and delta-encoded timestamps. The encoder is `src/glr.py` (shared by both
+bootstraps); the collector decodes it with `src/trace_format.rs`. The on-disk
+`.glr` is the same format. See [the spec](design/glr-format.md).
+
+> **Status:** both bootstraps are wired into `attach`. `--runtime` selects which
+> is injected: `gevent`, `asyncio`, or `auto` (the default — `main.rs` writes both
+> filled templates plus a small selector that execs the right one based on the
+> target's loaded modules: gevent if the `gevent` package is imported, else
+> asyncio). asyncio is the newer path.
+
+Because the hook runs on the
 target's hot path, it talks over the raw `_socket` C module rather than
 cooperative or event-loop sockets, so streaming an event can never re-enter the
 scheduler and recurse.
@@ -70,7 +85,7 @@ sequenceDiagram
     participant Py as python3 helper
     participant T as target process
     participant BR as browser
-    GL->>GL: bind /tmp/greenlane-PID.sock
+    GL->>GL: bind control socket in a private /tmp dir
     GL->>Py: sys.remote_exec(pid, bootstrap)
     Py->>T: exec runtime bootstrap
     T->>T: install scheduler hook + gc.callbacks
@@ -78,20 +93,25 @@ sequenceDiagram
     GL->>GL: fold switches into slices, append to store
     opt --serve
         loop while the viewer is open
-            GL-->>BR: slices appended since this client's cursor
+            BR->>GL: request viewport [t0,t1]
+            GL-->>BR: binary columnar window for that range
         end
     end
 ```
 
-## Lossless streaming
+## Request-driven windows
 
-Each viewer holds a cursor — the number of slices it has already received — and
-the server hands back the contiguous tail since that cursor on a fixed timer.
-That makes streaming lossless: there is no broadcast channel to fall behind on,
-no dropped events under load, and therefore no expensive full-snapshot resyncs.
-It is also the seam where server-side level-of-detail will eventually live; today
-the browser receives raw slices, but the same cursor call can later return
-per-pixel aggregates so the wire and the client stay bounded by the screen.
+The viewer is **pull-based**: it requests exactly the viewport it's showing
+(`{t0,t1}`) and the server answers from the store with a compact binary columnar
+frame for that range — typed-array columns plus a small JSON header, no per-slice
+JSON. Each request carries a monotonic id the server echoes, so a reply that
+arrives after the view has moved on is dropped. While live, the server also pushes
+a tiny `head` (span/total/bytes) on a timer so the viewer follows the edge and the
+header stays current; the actual slice data is always pulled, never broadcast, so
+there's no channel to fall behind on. This request seam is where server-side
+level-of-detail will live: today a window returns raw slices (capped), but the
+same call can later return per-pixel aggregates so the wire and client stay
+bounded by the screen.
 
 ## The viewer
 
@@ -108,34 +128,71 @@ Above the lanes, a CPU graph tracks the busy fraction of the single scheduler
 thread in step with the spans below, and vertical markers call out each garbage
 collection, with the generation, duration and objects freed available on hover.
 Runs that stretch into the tens of milliseconds are tinted to draw the eye —
-yellow past roughly 20 ms and red past 50 ms, with the scheduler lane itself
-never flagged since it is expected to dominate while the loop is idle — and the
-same slow spans are gathered into a collapsible log you can filter by severity,
-sort by time or duration, and click to jump straight to the offending span on
-the timeline.
+yellow past the warn threshold (≈20 ms) and red past the block threshold
+(≈50 ms), both configurable with `--warn-ms` / `--block-ms`, and with the
+scheduler lane itself never flagged since it is expected to dominate while the
+loop is idle.
 
-Selecting a span opens its full call stack as captured at the switch, listed
-file by file and line by line; clicking a frame opens that location in your
-editor of choice (VS Code, Cursor, Zed or PyCharm). Lanes can be ordered by
-identity or by recent activity over the last second, ten seconds, minute or the
-whole capture, and the time axis can read as elapsed time, local wall-clock or
-UTC. A live session follows the leading edge as it grows, lets you drag out a
-region to zoom into, pan freely, and inspect any single lane in detail — and a
-detach control stops instrumenting and removes the hook from the target, leaving
-the process exactly as greenlane found it.
+### Slow log
+
+Those slow spans are also gathered into a collapsible **slow log** docked at the
+bottom of the viewer. Unlike the timeline (which only holds the visible
+viewport), the slow log is a query run in the database over the **whole** capture,
+so it surfaces every span past the threshold no matter where you're zoomed — its
+badge shows the true total count, not a windowed sample. Filter it (all / warn /
+block-tier only), sort by time or duration, and click any row to seek the
+timeline straight to that span. It runs even while collapsed, so the badge stays
+live and opening it is instant.
+
+### Call traces (`--include-traces off|slow|all`)
+
+Selecting a span opens a detail panel with its timing and identity. When a span
+has a captured stack it also shows the **full call stack**, listed file by file
+and line by line, each frame clickable to open at that `file:line` in your editor
+(VS Code, Cursor, Zed or PyCharm).
+
+Walking the Python stack is the single most expensive thing the hook does on the
+target's hot path, so it's **gated by `--include-traces`** and done lazily. The
+walk runs at a span's _close_ — when its duration is known — on the greenlet/task
+that just yielded, so the captured stack is the span's **yield point** (where it
+gave up control, often the blocking call). Modes:
+
+- **`slow`** (default): walk only spans at/over the warn threshold (`--warn-ms`).
+  The cost is paid solely for the slow spans you'd investigate, so traces are
+  cheap enough to leave on.
+- **`all`**: walk every span (exhaustive; a walk per switch / task step).
+- **`off`**: never walk.
+
+Every span still carries a cheap leaf-function label (captured at resume) in all
+modes. On the wire the binary format interns each distinct stack into a pool and
+sends it once (ADR 0001), so a repeated chain costs only an id. Use `all`/`slow`
+to investigate _where_ time goes; `off` for the lowest-overhead monitoring on very
+high-switch-rate apps.
+
+Lanes can be ordered by identity or by recent activity over the last second, ten
+seconds, minute or the whole capture, and the time axis can read as elapsed time,
+local wall-clock or UTC. A live session follows the leading edge as it grows,
+lets you drag out a region to zoom into, pan freely, and inspect any single lane
+in detail — and a detach control stops instrumenting and removes the hook from
+the target, leaving the process exactly as greenlane found it. The **system**
+button (beside help) opens a panel with host, process, interpreter, and live
+kernel scheduler-lag details for the target.
 
 ## Limitations
 
 Because the trace hook runs on the target's hot path, very high switch rates add
-real overhead — the full-path call stack is the largest field on each event, and
-it is interned client-side to keep the wire and memory in check. Per-span times
-are stored as 32-bit milliseconds relative to the start of the trace, which
-holds microsecond resolution over a session lasting minutes. There is no
-server-side level-of-detail yet, so the browser holds the entire timeline; that
-is comfortable for typical sessions but a multi-hour capture would want
-viewport-scoped aggregation. Finally, the viewer is served over plain HTTP with
-no authentication, so bind it to `127.0.0.1` and reach it through an SSH tunnel
-rather than exposing it directly.
+real overhead — most of it the stack walk, which is why `--include-traces`
+defaults to `slow` (walk only slow spans) rather than `all`. Stacks are interned
+on the wire and again client-side to keep memory in check. Per-span times cross
+the wire as 32-bit milliseconds **relative to the requested window's start** (and
+the GPU renders in that window-relative space), so sub-millisecond placement holds
+even hours into a capture — an absolute-offset f32 would lose it. There is no
+server-side level-of-detail yet, so the browser holds the visible window plus a
+margin; that is comfortable for typical sessions but a multi-hour capture would
+want viewport-scoped aggregation. Finally, the viewer is served over plain HTTP:
+a per-session token (the capability URL greenlane prints) gates `/ws`, `/info`,
+and `/detach`, but the traffic isn't encrypted — for a remote host bind to
+`127.0.0.1` and reach it through an SSH tunnel rather than exposing it directly.
 
 ## Attaching — full requirements & troubleshooting
 

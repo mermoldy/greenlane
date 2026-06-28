@@ -30,6 +30,11 @@ cargo build --locked
 bun run --cwd web build
 ```
 
+For the inner loop, prefer `cargo check --locked` as the fast compile gate —
+`cargo build --locked` pulls in bundled native dependencies and can take a while
+from a cold target dir, so reserve the full build for the pre-handoff run above
+and for CI/release.
+
 The pre-commit suite includes general file hygiene, `cargo fmt`, Ruff lint and
 format, Prettier, markdownlint, TypeScript type checking, `ty`, pytest, Bun
 tests, and lychee in offline mode.

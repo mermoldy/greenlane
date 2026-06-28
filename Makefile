@@ -4,8 +4,10 @@ NS        := sbabak
 POD       := scalr-server-0
 CONTAINER := scalr
 BIN       := greenlane
+PID       ?= 1402
+PORT      ?= 8080
 
-.PHONY: web build run cross-setup linux deploy remote clean
+.PHONY: web build run cross-setup linux deploy remote remote-stop clean
 
 web: ## Build the viewer bundle (embedded into the binary via rust-embed)
 	cd web && bun install && bun run build
@@ -25,9 +27,21 @@ linux: web ## Cross-compile a static Linux binary
 deploy: linux ## Build the Linux binary and copy it into the k8s pod
 	kubectl cp -n $(NS) -c $(CONTAINER) target/$(TARGET)/release/$(BIN) $(POD):/tmp/$(BIN)
 
-remote: ## run server on k8s pod
-	kubectl exec -n $(NS) -c $(CONTAINER) $(POD) -- /tmp/$(BIN) attach 64 --serve 0.0.0.0:8080 & \
-	kubectl port-forward -n sbabak pod/scalr-server-0 8080:8080
+remote-stop: ## Stop any prior remote greenlane + local port-forward (frees the port)
+	# In-pod server. pkill skips itself; the [g] bracket avoids matching this command.
+	-kubectl exec -n $(NS) -c $(CONTAINER) $(POD) -- pkill -f '[g]reenlane attach'
+	# Local helpers left over from a previous `make remote` (the streamed exec and
+	# the port-forward), matched without self-matching via the [k] bracket trick.
+	-pkill -f '[k]ubectl exec.*$(POD).*$(BIN)'
+	-pkill -f '[k]ubectl port-forward.*$(POD).*$(PORT)'
+
+remote: remote-stop ## Run the server on the pod and port-forward it locally (PID=… PORT=… to override)
+	# remote-stop first clears the old process so the pod's $(PORT) is free; give it
+	# a moment to release the socket before binding again.
+	sleep 1
+	kubectl exec -n $(NS) -c $(CONTAINER) $(POD) -- /tmp/$(BIN) attach $(PID) --serve 0.0.0.0:$(PORT) & \
+	sleep 2; \
+	kubectl port-forward -n $(NS) $(POD) $(PORT):$(PORT)
 
 clean: ## Remove build artifacts
 	cargo clean

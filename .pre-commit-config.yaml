@@ -69,7 +69,7 @@ repos:
 
       - id: ty-check
         name: ty check
-        entry: uv run ty check --no-progress --ignore invalid-assignment --ignore unresolved-attribute
+        entry: uv run ty check --no-progress
         language: system
         pass_filenames: false
         types_or: [python, pyi]
@@ -92,6 +92,6 @@ repos:
     rev: lychee-v0.21.0
     hooks:
       - id: lychee
-        name: lychee offline
+        name: lychee
         args: ["--offline", "--no-progress"]
         types_or: [markdown, html, yaml]

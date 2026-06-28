@@ -39,6 +39,9 @@ export interface Hover {
 }
 
 const MIN_PX = 1; // smallest rendered slice width; proportional above this
+// How far before the trace start (ms) the view may scroll — a small buffer for
+// zoom-out breathing room, but not infinite empty space.
+const LEFT_BUFFER_MS = 120_000;
 const MAX_PXPERMS = 1000; // max zoom = 1px per 1µs
 const MIN_PXPERMS = 1 / 200; // min zoom = 1px per 200ms
 const ZOOM_SENS = 0.0008; // wheel-zoom sensitivity (lower = finer/slower)
@@ -52,6 +55,13 @@ const WARN_MS = 20; // spans longer than this get a yellow border
 const SLOW_MS = 50; // spans longer than this get a red border
 const BIN_MS = 1; // CPU histogram resolution: non-Hub run-time per 1ms bin
 const TEX_W = 4096; // row-lookup texture width; 2D-wrapped to scale past 16k tracks
+// Max distinct lanes a *capped live* session keeps before folding further new
+// gids into one shared "(other)" lane. The server already evicts old row DATA in
+// these sessions; this bounds the per-lane metadata (names, colors, row map) so a
+// long run that churns through millions of short-lived tasks can't grow it
+// without limit. Generous — a timeline with this many lanes is already unreadable;
+// the cap is a memory guard, not a display choice. Recordings are never capped.
+const MAX_LIVE_TRACKS = 20_000;
 // Shared axis font — matches the DOM track labels for consistent styling.
 const AXIS_FONT = "11px ui-monospace, 'SF Mono', Menlo, monospace";
 
@@ -85,7 +95,7 @@ function trackRank(name: string): [number, number, string] {
 
 const VERT = `#version 300 es
 layout(location=0) in vec2 a_corner;
-layout(location=1) in float a_start;   // ms relative to trace start
+layout(location=1) in float a_start;   // ms relative to the loaded window's t0
 layout(location=2) in float a_dur;     // ms
 layout(location=3) in float a_track;   // stable track id
 layout(location=4) in vec3 a_color;
@@ -158,19 +168,49 @@ function compile(
 // spans are red — so greenlet hues are mapped to bands that avoid both.
 const HUB_COLOR: [number, number, number] = [163 / 255, 190 / 255, 140 / 255];
 
+// "duration" color mode: fill greenlet spans by how long they ran rather than by
+// identity — blue under the warn threshold (ok), yellow up to the block
+// threshold, red beyond it. The Hub keeps its theme green. Yellow/red match the
+// highlight-border tones so the two modes read consistently.
+const OK_COLOR: [number, number, number] = [0.36, 0.62, 0.92]; // blue: < warn
+const DUR_WARN_COLOR: [number, number, number] = [0.92, 0.8, 0.36]; // yellow
+const DUR_SLOW_COLOR: [number, number, number] = [0.92, 0.22, 0.27]; // red
+
 // Stable lane color keyed off the greenlet NAME (not insertion index), so a
-// greenlet keeps its hue even as windows are swapped in and out of memory.
-// Remapped into allowed hue bands: orange/yellow [25,80) and cyan/blue/purple/
-// magenta [165,330) — skipping red (~0/360) and green (~95-155).
+// greenlet keeps its color even as windows are swapped in and out of memory.
+//
+// To stay distinct across *thousands* of greenlets we spread them over hue AND
+// saturation AND lightness (one hue band alone only yields a few dozen telling
+// colors). The driving index is the greenlet's numeric id when the name carries
+// one (e.g. "Greenlet-1234") so consecutive greenlets land far apart; otherwise
+// a hash of the name. Each channel advances by a distinct irrational step (a
+// low-discrepancy / golden-ratio sequence) so the whole palette fills evenly
+// without clustering. Hue stays in allowed bands — orange/yellow [25,82) and
+// cyan/blue/purple/magenta [162,336) — skipping red (slow spans) and green (Hub).
 function colorForName(name: string): [number, number, number] {
-  let acc = 0;
-  for (let i = 0; i < name.length; i++) acc = (acc * 31 + name.charCodeAt(i)) >>> 0;
-  const t = (acc % 100003) / 100003;
-  const seg1 = 55,
-    seg2 = 165; // band widths
-  const pos = t * (seg1 + seg2);
-  const h = pos < seg1 ? 25 + pos : 165 + (pos - seg1);
-  return hsl(h, 0.55, 0.6);
+  const m = name.match(/(\d+)(?!.*\d)/); // last run of digits, if any
+  let idx: number;
+  if (m) {
+    idx = parseInt(m[1], 10);
+  } else {
+    let h = 2166136261 >>> 0; // FNV-1a
+    for (let i = 0; i < name.length; i++) {
+      h ^= name.charCodeAt(i);
+      h = Math.imul(h, 16777619) >>> 0;
+    }
+    idx = h;
+  }
+  const frac = (n: number, step: number) => (n * step) % 1;
+  // Hue: golden-angle spread, remapped into the two allowed bands.
+  const seg1 = 57,
+    seg2 = 174; // band widths
+  const pos = frac(idx, 0.6180339887) * (seg1 + seg2);
+  const hue = pos < seg1 ? 25 + pos : 162 + (pos - seg1);
+  // Saturation + lightness vary too (each its own irrational step) for a much
+  // larger distinct palette; kept in ranges that read well on the dark theme.
+  const sat = 0.48 + 0.34 * frac(idx, 0.7548776662);
+  const light = 0.5 + 0.22 * frac(idx, 0.569840291);
+  return hsl(hue, sat, light);
 }
 function hsl(h: number, s: number, l: number): [number, number, number] {
   const c = (1 - Math.abs(2 * l - 1)) * s;
@@ -199,6 +239,10 @@ interface Attr {
 
 export type SortMode =
   "ident" | "activity" | "recent1" | "recent10" | "recent60";
+
+// How span fill is colored: "ident" = a stable per-greenlet color (default);
+// "duration" = blue/yellow/red by run length (Hub stays green).
+export type ColorMode = "ident" | "duration";
 
 export class Timeline {
   private gl: WebGL2RenderingContext;
@@ -244,10 +288,21 @@ export class Timeline {
   private trackName: string[] = [];
   private hubTrack: boolean[] = []; // track id -> is it a Hub (waiting, not CPU)
   private trackRun: number[] = []; // track id -> total run-time (ms) = activity
+  // Whether the live session caps how much it keeps in memory (server retention
+  // horizon). When set, lane identity is bounded too: see overflowTrack().
+  retentionActive = false;
+  // Shared "(other lanes)" track that bounds lane-identity growth once a capped
+  // live session exceeds MAX_LIVE_TRACKS distinct gids. -1 until first needed.
+  private overflowRt = -1;
   sortMode: SortMode = "recent1";
   private lastSortMs = 0;
-  private placed = 0; // tracks already assigned a row (stable while paused)
-  private forceSort = false; // a sort-mode change forces one resort even if paused
+  // Lane rows are kept STABLE across window swaps: once a greenlet has a row it
+  // keeps it; new greenlets append at the bottom; a full re-sort happens only on
+  // an explicit sort-mode change or (while following) a throttled interval. This
+  // is what keeps the Hub pinned, `ident` order steady, and the selected lane
+  // from scrolling off when zooming changes which greenlets are in the window.
+  private placed = 0; // greenlets already assigned a stable row
+  private forceSort = false; // a sort-mode change forces one full re-sort
   // Time-axis display mode + wall-clock epoch (ms) at trace t0 (NaN if unknown).
   timeMode: "relative" | "current" | "utc" = "relative";
   epochMs = NaN;
@@ -265,6 +320,9 @@ export class Timeline {
   private gcDur: number[] = [];
   private gcGen: number[] = [];
   private gcColl: number[] = [];
+  // Whether the GC marker layer is drawn (toggleable from the toolbar). The data
+  // is always collected/counted; this only gates rendering + hover readout.
+  showGc = true;
 
   // track id <-> display row, uploaded as a 1×N R32F lookup texture.
   private rowTex: WebGLTexture;
@@ -276,16 +334,17 @@ export class Timeline {
   viewT0 = 0;
   pxPerMs = 1;
   scrollY = 0;
+  // ms from origin to the loaded window's t0. The GPU span buffer (`a_start`) holds
+  // window-relative starts, so the render rebases `u_viewT0` by this much; both
+  // operands of `a_start - u_viewT0` stay small → no f32 cancellation on long runs.
+  private glBaseMs = 0;
   trackH = 18;
   follow = true;
   private fitted = false;
-  // Smooth-follow: the live edge is driven by the LOCAL clock (anchorData maps
-  // to anchorLocal = performance.now()), so scrolling is perfectly smooth and
-  // independent of when WebSocket batches arrive. A tiny per-frame drift term
-  // realigns it with the newest data without visible lurches.
-  private anchorData = 0;
-  private anchorLocal = 0;
-  private wasFollowing = false;
+  // Live session? When true, "now" is driven by the wall clock (Date.now-epochMs)
+  // so the follow edge advances in real time and the arrival lag is visible; when
+  // false (recording) the edge is the end of the captured data.
+  live = false;
 
   // ── Viewport windowing ────────────────────────────────────────────────
   // Only the visible window's slices live in memory; the server is queried as
@@ -295,15 +354,40 @@ export class Timeline {
   private originNs = 0;
   private originSet = false;
   fullSpanMs = 0;
+  // Span highlight thresholds (ms): warn = yellow border, slow/block = red.
+  // Defaults match the server; overridden from `meta` (--warn-ms/--block-ms).
+  warnMs = WARN_MS;
+  slowMs = SLOW_MS;
+  // Lane fill: by greenlet identity (default) or by span duration.
+  colorMode: "ident" | "duration" = "ident";
   /** Fired (throttled) when the visible range changes → app requests that window.
    *  Args: absolute t0/t1 in ns, and canvas width in px. */
   onViewport: ((t0ns: number, t1ns: number, px: number) => void) | null = null;
   private lastVpMs = 0;
-  private firedViewT0 = NaN;
-  private firedPxPerMs = NaN;
+  // At most one viewport request is outstanding at a time. Following re-requests
+  // every ~250ms, but a large (zoomed-out) window's reply can take longer than
+  // that to compute + decode; without this guard each reply is superseded by a
+  // newer request and dropped as stale, so the timeline freezes and never picks
+  // up new data. `windowApplied()` (called when a reply lands) clears it; the
+  // VP_TIMEOUT backstop re-arms following if a reply is ever lost.
+  private vpInFlight = false;
+  private vpSentMs = 0;
+  // Diagnostics (read by the UI's debug logging): wall time the last window took
+  // to ingest+upload, and whether the server truncated it (hit the slice cap).
+  lastLoadMs = 0;
+  lastWindowCapped = false;
+  // Absolute ns range currently loaded in memory. We fetch a window WIDER than
+  // the viewport (a margin on each side), so panning/zooming within it needs no
+  // server round-trip — we only refetch when the view leaves this range (or, when
+  // following, on a slower timer to pick up new data at the live edge).
+  private loadedT0 = 0;
+  private loadedT1 = -1;
   // A span highlighted from the slow-log (ms relative to origin + click time, for
   // the flash). Drawn as a bright time band so the clicked span is easy to find.
   private hl: { t0Ms: number; t1Ms: number; at: number } | null = null;
+  // Pending vertical scroll target (greenlet gid) from a slow-log click: the
+  // lane may not be in memory yet, so we scroll once its window streams in.
+  private scrollToGid: number | null = null;
 
   private mouseX = -1;
   private mouseY = -1;
@@ -467,14 +551,14 @@ export class Timeline {
       this.cFunc[i] = this.intern(sl.func, this.funcTab, this.funcMap);
       this.cTask[i] = this.intern(sl.task, this.taskTab, this.taskMap);
       this.cStack[i] = this.intern(sl.stack, this.stackTab, this.stackMap);
-      // Highlight slow spans (yellow > 20ms, red > 50ms) — but the Hub waiting
+      // Highlight slow spans (yellow ≥ warn, red ≥ block) — but the Hub waiting
       // in the event loop is not work, so it's never flagged.
       const durMs = sl.dur / 1e6;
       this.cSlow[i] = this.hubTrack[track]
         ? 0
-        : durMs > SLOW_MS
+        : durMs >= this.slowMs
           ? 2
-          : durMs > WARN_MS
+          : durMs >= this.warnMs
             ? 1
             : 0;
       if (this.cSlow[i] >= 1) this.slowIdx.push(i);
@@ -482,7 +566,10 @@ export class Timeline {
       if (endMs > this.spanMs) this.spanMs = endMs;
       this.trackRun[track] += durMs;
       if (!this.hubTrack[track]) this.addCpu(this.cStart[i], durMs);
-      const [r, g, b] = this.colorOf(track);
+      const [r, g, b] =
+        this.colorMode === "duration" && !this.hubTrack[track]
+          ? this.durRgb(durMs)
+          : this.colorOf(track);
       this.cColor[i * 3] = r;
       this.cColor[i * 3 + 1] = g;
       this.cColor[i * 3 + 2] = b;
@@ -522,16 +609,17 @@ export class Timeline {
     }
 
     let order: number[];
-    if (!this.follow && !this.forceSort) {
-      // Paused: never reorder existing rows; just append any new greenlets at
-      // the bottom so the layout stays stable while you inspect.
+    if (!this.follow && !this.forceSort && this.placed > 0) {
+      // Established order + not following: keep existing rows stable; only append
+      // greenlets newly seen in this window at the bottom. (placed === 0 means no
+      // order yet, so fall through to a full sort — which pins the Hub.)
       order = new Array(this.nTracks);
       for (let r = 0; r < this.placed; r++) order[r] = this.rowToTrack[r];
       let r = this.placed;
       for (let id = this.placed; id < this.nTracks; id++) order[r++] = id;
     } else {
-      // Per-track activity for the sort: lifetime total, or run-time within a
-      // recent window (so ranking reflects what's busy now).
+      // Full sort: Hub(s) pinned on top, then greenlets by the chosen mode.
+      // Per-track activity = lifetime total, or run-time within a recent window.
       let act: number[] | Float64Array | null = null;
       if (this.sortMode === "activity") {
         act = this.trackRun;
@@ -606,6 +694,7 @@ export class Timeline {
     this.trackName = [];
     this.hubTrack = [];
     this.trackRun = [];
+    this.overflowRt = -1;
     this.t0ns = this.originSet ? this.originNs : NaN;
     this.fitted = false;
     this.rowsDirty = false;
@@ -656,7 +745,7 @@ export class Timeline {
 
   /** Index of the GC pause whose band the cursor x falls in, or -1. */
   private gcAt(px: number): number {
-    if (isNaN(this.t0ns)) return -1;
+    if (!this.showGc || isNaN(this.t0ns)) return -1;
     for (let i = this.gcStart.length - 1; i >= 0; i--) {
       const sMs = (this.gcStart[i] - this.t0ns) / 1e6;
       const x0 = (sMs - this.viewT0) * this.pxPerMs;
@@ -701,7 +790,9 @@ export class Timeline {
   /** Lane color: the Hub is always the reserved green; everything else gets a
    *  non-red, non-green hue. */
   private colorOf(track: number): [number, number, number] {
-    return this.hubTrack[track] ? HUB_COLOR : colorForName(this.trackName[track] ?? "");
+    return this.hubTrack[track]
+      ? HUB_COLOR
+      : colorForName(this.trackName[track] ?? "");
   }
 
   private maxT(): number {
@@ -773,24 +864,148 @@ export class Timeline {
     this.fullSpanMs = spanNs / 1e6;
   }
 
-  /** Replace the in-memory data with a freshly-fetched window, dropping whatever
-   *  was held before. Preserves view state (zoom/pan/follow) and the fixed origin
-   *  so the swap is seamless; track identity is rebuilt from the window (colors
-   *  are keyed off gid, so they stay stable across swaps). */
-  replaceWindow(
-    slices: Slice[],
-    gc: { start: number; dur: number; gen: number; collected: number }[],
+  /** The live edge in trace-relative ms: "now" (wall clock) for a live session,
+   *  else the end of captured data. `max` with the data span guards against clock
+   *  skew so real spans are never clipped past the edge. */
+  liveEdgeMs(): number {
+    if (this.live && Number.isFinite(this.epochMs)) {
+      return Math.max(Date.now() - this.epochMs, this.fullSpanMs);
+    }
+    return this.fullSpanMs;
+  }
+
+  /** Arrival lag (ms): how far the latest rendered data trails real time — i.e.
+   *  "now" minus the newest captured span. 0 for recordings / unknown epoch. */
+  liveLagMs(): number {
+    if (this.live && Number.isFinite(this.epochMs)) {
+      return Math.max(0, Date.now() - this.epochMs - this.fullSpanMs);
+    }
+    return 0;
+  }
+
+  /** Warn/block span-duration thresholds (ms), from the server config, so span
+   *  highlight colors match the slow-log filter. */
+  setThresholds(warnMs: number, slowMs: number) {
+    this.warnMs = warnMs;
+    this.slowMs = slowMs;
+  }
+
+  /** Show or hide the GC marker layer. The continuous render loop picks the
+   *  change up next frame; GC data stays collected and counted regardless. */
+  setShowGc(v: boolean) {
+    this.showGc = v;
+  }
+
+  /** Lane fill mode: "ident" (per-greenlet color) or "duration" (color spans by
+   *  how long they ran: blue < warn, yellow < block, red beyond). */
+  setColorMode(m: "ident" | "duration") {
+    if (this.colorMode === m) return;
+    this.colorMode = m;
+    // Recolor every span already in memory and re-upload its color buffer; the
+    // render loop is continuous, so the change appears on the next frame.
+    for (let i = 0; i < this.count; i++) {
+      const track = this.cTrack[i];
+      const [r, g, b] =
+        m === "duration" && !this.hubTrack[track]
+          ? this.durRgb(this.cDur[i])
+          : this.colorOf(track);
+      this.cColor[i * 3] = r;
+      this.cColor[i * 3 + 1] = g;
+      this.cColor[i * 3 + 2] = b;
+    }
+    if (this.count > 0) {
+      this.gl.bindVertexArray(this.vao);
+      this.subUpload(this.aColor, this.cColor, 0, this.count);
+    }
+  }
+
+  /** Duration-mode RGB for a span of `durMs` (non-Hub). */
+  private durRgb(durMs: number): [number, number, number] {
+    return durMs >= this.slowMs
+      ? DUR_SLOW_COLOR
+      : durMs >= this.warnMs
+        ? DUR_WARN_COLOR
+        : OK_COLOR;
+  }
+
+  /** Record the absolute ns range a freshly-loaded window covers, so the frame
+   *  loop knows when a pan/zoom stays inside it and can skip a refetch. Call AFTER
+   *  loadWindowColumnar.
+   *
+   *  When the window was `capped`, the server truncated it to the contiguous
+   *  *center* of the requested range, so the only range we can trust we hold is
+   *  exactly the data we received: `[minStartNs, maxEndNs]`. Beyond that — on
+   *  either truncated edge — slices may be missing, so a pan there must refetch.
+   *  When not capped we got everything in the requested window (empty margins are
+   *  genuinely empty), so the full requested range is trustworthy. */
+  setLoadedRange(
+    t0ns: number,
+    t1ns: number,
+    minStartNs: number,
+    maxEndNs: number,
+    capped: boolean,
+    n: number,
   ) {
+    this.lastWindowCapped = capped;
+    if (capped && n > 0) {
+      this.loadedT0 = minStartNs;
+      this.loadedT1 = maxEndNs;
+    } else {
+      this.loadedT0 = t0ns;
+      this.loadedT1 = t1ns;
+    }
+  }
+
+  /** A viewport reply has arrived (or was dropped) — clear the in-flight guard so
+   *  follow can issue the next request. Bounds outstanding requests to one. */
+  windowApplied() {
+    this.vpInFlight = false;
+  }
+
+  /** The shared "(other lanes)" track, created on first use. Bounds lane-identity
+   *  growth in a capped live session (see MAX_LIVE_TRACKS). */
+  private overflowTrack(): number {
+    if (this.overflowRt < 0) {
+      this.overflowRt = this.nTracks++;
+      this.trackName[this.overflowRt] = "…(other lanes)";
+      this.hubTrack[this.overflowRt] = false;
+      this.trackRun[this.overflowRt] = 0;
+      this.rowsDirty = true;
+    }
+    return this.overflowRt;
+  }
+
+  /** Load a freshly-fetched window from the server's **binary columnar frame**,
+   *  dropping the previous window's spans. Reads the typed-array columns straight
+   *  into the GPU columns — no per-slice JS objects, no JSON parse. Crucially it
+   *  KEEPS lane identity (gid → track, names, hub-ness, assigned rows) so lanes
+   *  don't reshuffle when the window changes; only the per-window slice/CPU/GC
+   *  data resets. View state (zoom/pan/follow) and the fixed origin are preserved.
+   *
+   *  Columns are parallel arrays of length `n`: `startMs`/`durMs` and
+   *  `trackIdx`/`funcIdx`/`taskIdx`/`stackIdx` (indices into `tracks` and the
+   *  `dict` string tables). `startMs` is **relative to the window's `t0Ns`** (small
+   *  → f32-precise); we recover absolute ms (`cStart`, in f64) by adding the base,
+   *  and upload the *relative* values to the GPU so the shader's `a_start - viewT0`
+   *  subtracts small numbers (no catastrophic f32 cancellation hours into a run). */
+  loadWindowColumnar(
+    t0Ns: number,
+    tracks: { gid: number; name: string; isHub: boolean; runNs: number }[],
+    gc: { start: number; dur: number; gen: number; collected: number }[],
+    dict: { func: string[]; task: string[]; stack: string[] },
+    startMs: Float32Array,
+    durMs: Float32Array,
+    trackIdx: Uint32Array,
+    funcIdx: Uint32Array,
+    taskIdx: Uint32Array,
+    stackIdx: Uint32Array,
+  ) {
+    const _loadStart = performance.now();
+    // Reset per-window data; keep lane identity for stable rows (see addSlices).
     this.count = 0;
     this.spanMs = 0;
-    this.nTracks = 0;
-    this.trackOf.clear();
-    this.trackName = [];
-    this.hubTrack = [];
-    this.trackRun = [];
-    this.rowsDirty = true;
-    this.placed = 0;
     this.slowIdx = [];
+    this.trackRun = new Array(this.nTracks).fill(0);
     this.funcTab = [""];
     this.funcMap = new Map([["", 0]]);
     this.taskTab = [""];
@@ -803,8 +1018,113 @@ export class Timeline {
     this.gcDur = [];
     this.gcGen = [];
     this.gcColl = [];
-    this.addSlices(slices);
+
+    // Map each window track to a (persistent) renderer track by gid, creating
+    // new lanes for greenlets not seen before.
+    const trackMap = new Array<number>(tracks.length);
+    for (let ti = 0; ti < tracks.length; ti++) {
+      const t = tracks[ti];
+      let rt = this.trackOf.get(t.gid);
+      if (rt === undefined) {
+        if (this.retentionActive && this.nTracks >= MAX_LIVE_TRACKS) {
+          // Capped live session past the lane cap: fold this (and every further)
+          // new gid into the shared overflow lane. Deliberately NOT recorded in
+          // trackOf, so that map stays bounded too — these gids re-resolve to the
+          // overflow lane on each window.
+          rt = this.overflowTrack();
+        } else {
+          rt = this.nTracks++;
+          this.trackOf.set(t.gid, rt);
+          this.trackName[rt] = t.name || `0x${t.gid.toString(16)}`;
+          this.hubTrack[rt] = t.isHub;
+          this.rowsDirty = true;
+        }
+      }
+      if (this.trackRun[rt] === undefined) this.trackRun[rt] = 0;
+      trackMap[ti] = rt;
+    }
+    // Intern the window's string dictionaries into our tables once; per-slice we
+    // just remap the dictionary index → intern id.
+    const fr = dict.func.map((s) => this.intern(s, this.funcTab, this.funcMap));
+    const tr = dict.task.map((s) => this.intern(s, this.taskTab, this.taskMap));
+    const sr = dict.stack.map((s) =>
+      this.intern(s, this.stackTab, this.stackMap),
+    );
+
+    // ms from the fixed origin to this window's t0 (f64 — precise). `startMs` is
+    // window-relative; absolute ms = baseMs + startMs[i]. The GPU gets the relative
+    // values (this.glBaseMs holds baseMs so the shader rebases viewT0 to match).
+    const baseMs = (t0Ns - this.originNs) / 1e6;
+    this.glBaseMs = baseMs;
+
+    const n = startMs.length;
+    if (n > this.cap) this.grow(n);
+    for (let i = 0; i < n; i++) {
+      const rt = trackMap[trackIdx[i]];
+      const d = durMs[i];
+      const absStart = baseMs + startMs[i]; // absolute ms since origin (f64)
+      this.cStart[i] = absStart;
+      this.cDur[i] = d;
+      this.cTrack[i] = rt;
+      this.cGid[i] = tracks[trackIdx[i]].gid;
+      this.cFunc[i] = fr[funcIdx[i]];
+      this.cTask[i] = tr[taskIdx[i]];
+      this.cStack[i] = sr[stackIdx[i]];
+      this.cSlow[i] = this.hubTrack[rt]
+        ? 0
+        : d >= this.slowMs
+          ? 2
+          : d >= this.warnMs
+            ? 1
+            : 0;
+      if (this.cSlow[i] >= 1) this.slowIdx.push(i);
+      const endMs = absStart + d;
+      if (endMs > this.spanMs) this.spanMs = endMs;
+      this.trackRun[rt] += d;
+      if (!this.hubTrack[rt]) this.addCpu(absStart, d);
+      const [r, g, b] =
+        this.colorMode === "duration" && !this.hubTrack[rt]
+          ? this.durRgb(d)
+          : this.colorOf(rt);
+      this.cColor[i * 3] = r;
+      this.cColor[i * 3 + 1] = g;
+      this.cColor[i * 3 + 2] = b;
+    }
+    this.count = n;
+
+    const gl = this.gl;
+    gl.bindVertexArray(this.vao);
+    // Upload the WINDOW-RELATIVE starts (small → f32-precise); the vertex shader
+    // adds them back via u_viewT0 rebased by glBaseMs. (cStart holds the absolute
+    // ms for CPU-side hit-testing/CPU bins, which work off viewT0 in f64.)
+    this.subUpload(this.aStart, startMs, 0, n);
+    this.subUpload(this.aDur, this.cDur, 0, n);
+    this.subUpload(this.aTrack, this.cTrack, 0, n);
+    this.subUpload(this.aColor, this.cColor, 0, n);
+    this.subUpload(this.aSlow, this.cSlow, 0, n);
     if (gc.length) this.addGc(gc);
+    this.lastLoadMs = performance.now() - _loadStart;
+  }
+
+  /** Snapshot of streaming/chunking state for the UI's debug console logging. */
+  metrics() {
+    const visMs = this.canvas.clientWidth / this.pxPerMs;
+    return {
+      loadedSlices: this.count,
+      loadedTracks: this.nTracks,
+      loadedMs: [
+        (this.loadedT0 - this.originNs) / 1e6,
+        (this.loadedT1 - this.originNs) / 1e6,
+      ] as [number, number],
+      viewMs: [this.viewT0, this.viewT0 + visMs] as [number, number],
+      fullSpanMs: this.fullSpanMs,
+      lagMs: this.liveLagMs(),
+      pxPerMs: this.pxPerMs,
+      follow: this.follow,
+      inFlight: this.vpInFlight,
+      lastLoadMs: this.lastLoadMs,
+      capped: this.lastWindowCapped,
+    };
   }
 
   /** Center the view on an absolute time (ns), canceling follow. */
@@ -816,9 +1136,10 @@ export class Timeline {
   }
 
   /** Jump to and zoom in on a span (absolute ns), framing it at ~40% of the
-   *  viewport and marking it with a highlight band. Used by the slow-log click;
-   *  the new window then streams in around it. */
-  revealSpanAt(startNs: number, durNs: number) {
+   *  viewport, scrolling vertically to its lane (`gid`), and marking it with a
+   *  highlight band. Used by the slow-log click; the window streams in around it,
+   *  and the vertical scroll is applied once that lane is present. */
+  revealSpanAt(startNs: number, durNs: number, gid: number) {
     const cw = this.canvas.clientWidth || 1000;
     const durMs = Math.max(durNs / 1e6, 1e-3);
     const sMs = (startNs - this.originNs) / 1e6;
@@ -829,6 +1150,7 @@ export class Timeline {
     );
     this.viewT0 = Math.max(0, sMs + durMs / 2 - cw / this.pxPerMs / 2);
     this.hl = { t0Ms: sMs, t1Ms: sMs + durMs, at: performance.now() };
+    this.scrollToGid = gid;
   }
 
   setDragMode(m: "pan" | "zoom") {
@@ -887,44 +1209,63 @@ export class Timeline {
     }
 
     const nowWall = performance.now();
+    const visMs = cw / this.pxPerMs;
+    // Live edge ("now") driven by the wall clock for a live session, or the end
+    // of the data for a recording. The view's right edge may never go past it,
+    // and the left edge is bounded by a small buffer (no infinite scroll either
+    // way). While following, the right edge tracks the live edge via the internal
+    // clock, so the timeline scrolls smoothly and spans fill in behind it as they
+    // arrive (the gap to the data = the arrival lag).
+    const liveEdge = this.liveEdgeMs();
+    const minViewT0 = -LEFT_BUFFER_MS;
+    const maxViewT0 = Math.max(minViewT0, liveEdge - visMs);
     if (this.follow) {
-      // Follow the whole capture's live edge (server-reported), not the last
-      // slice in the in-memory window.
-      const m = this.fullSpanMs > 0 ? this.fullSpanMs : this.maxT();
-      if (!this.wasFollowing) {
-        this.anchorData = m;
-        this.anchorLocal = nowWall;
-      }
-      // Edge position is purely a function of elapsed LOCAL time → smooth.
-      let edge = this.anchorData + (nowWall - this.anchorLocal);
-      const drift = m - edge;
-      if (Math.abs(drift) > 2000) {
-        // startup / tab-resume / big stall: snap.
-        this.anchorData = m;
-        this.anchorLocal = nowWall;
-        edge = m;
-      } else {
-        // gentle continuous realignment toward the newest data.
-        this.anchorData += drift * 0.01;
-        edge += drift * 0.01;
-      }
-      const visMs = cw / this.pxPerMs;
-      this.viewT0 = Math.max(0, edge - visMs * 0.9);
+      this.viewT0 = maxViewT0;
     }
-    this.wasFollowing = this.follow;
+    this.viewT0 = Math.min(maxViewT0, Math.max(minViewT0, this.viewT0));
 
-    // Tell the app which absolute time range is visible so it can fetch that
-    // window from the server (throttled to ~10/s; fires while following too).
+    // Request a window from the server only when needed — not every frame. The
+    // visible range maps to absolute ns; we fetch it expanded by a margin on each
+    // side, and skip the request entirely while the view stays inside what's
+    // already loaded. That makes pan/zoom within the margin instant (no round
+    // trip); following refetches on a slower timer to pick up the live edge.
     if (this.onViewport) {
-      const changed =
-        this.viewT0 !== this.firedViewT0 || this.pxPerMs !== this.firedPxPerMs;
-      if (changed && nowWall - this.lastVpMs >= 100) {
+      const visT0 = this.originNs + Math.max(0, this.viewT0) * 1e6;
+      const visT1 = this.originNs + (this.viewT0 + visMs) * 1e6;
+      const inside = visT0 >= this.loadedT0 && visT1 <= this.loadedT1;
+      // Is the view watching the live present (its right edge near the newest
+      // data)? Then keep it refreshing even when paused, so new spans stream in
+      // while you hold the view still. Inspecting older (immutable) data → quiet.
+      const viewRightMs = this.viewT0 + visMs;
+      const nearLive = this.live && viewRightMs >= this.fullSpanMs - visMs;
+      // Following: refresh ~4/s normally, but BACK OFF when the last window was
+      // expensive to load (large/zoomed-out captures hit the slice cap and each
+      // reload is a heavy decode+upload that blocks the main thread). Refetching
+      // every 250ms then never finishes — lag balloons with no visual progress.
+      // Cap main-thread occupancy at ~1/3 by spacing refetches at ~3× the last
+      // load cost (clamped 250ms…2s); a capped window forces at least 1s.
+      const followIv = Math.max(
+        this.lastWindowCapped ? 1000 : 250,
+        Math.min(2000, this.lastLoadMs * 3),
+      );
+      const due = this.follow
+        ? nowWall - this.lastVpMs >= followIv
+        : (!inside && nowWall - this.lastVpMs >= 100) ||
+          (nearLive && nowWall - this.lastVpMs >= 700);
+      // Only one request in flight: wait for the prior reply before issuing the
+      // next (a slow zoomed-out window otherwise gets every reply dropped as
+      // stale). VP_TIMEOUT re-arms if a reply was lost so follow can't deadlock.
+      const VP_TIMEOUT = 5000;
+      const free = !this.vpInFlight || nowWall - this.vpSentMs >= VP_TIMEOUT;
+      if (due && free) {
         this.lastVpMs = nowWall;
-        this.firedViewT0 = this.viewT0;
-        this.firedPxPerMs = this.pxPerMs;
-        const visMs = cw / this.pxPerMs;
-        const t0ns = Math.max(0, Math.floor(this.originNs + this.viewT0 * 1e6));
-        const t1ns = Math.ceil(this.originNs + (this.viewT0 + visMs) * 1e6);
+        this.vpInFlight = true;
+        this.vpSentMs = nowWall;
+        // Margin = one viewport width on each side (scales with zoom), so the
+        // loaded window is ~3× the visible range.
+        const margin = visT1 - visT0 || 1e6;
+        const t0ns = Math.max(0, Math.floor(visT0 - margin));
+        const t1ns = Math.ceil(visT1 + margin);
         this.onViewport(t0ns, t1ns, Math.max(1, Math.ceil(cw)));
       }
     }
@@ -941,6 +1282,17 @@ export class Timeline {
     }
     // Batched once-per-frame resort of track rows, then clamp vertical scroll.
     if (this.rowsDirty) this.recomputeRows();
+    // Apply a pending slow-log scroll once the target lane is present (its window
+    // has streamed in): center that lane vertically, then clear the request.
+    if (this.scrollToGid !== null) {
+      const track = this.trackOf.get(this.scrollToGid);
+      if (track !== undefined && this.rowOf[track] !== undefined) {
+        const areaH = this.canvas.clientHeight - HEADER_H;
+        this.scrollY =
+          this.rowOf[track] * this.trackH - areaH / 2 + this.trackH / 2;
+        this.scrollToGid = null;
+      }
+    }
     this.scrollY = Math.min(this.scrollY, this.maxScrollY());
     if (this.scrollY < 0) this.scrollY = 0;
 
@@ -950,7 +1302,10 @@ export class Timeline {
       gl.useProgram(this.prog);
       gl.bindVertexArray(this.vao);
       gl.uniform2f(this.u.u_res!, w, h);
-      gl.uniform1f(this.u.u_viewT0!, this.viewT0);
+      // Rebase viewT0 into the loaded window's coordinate space (matches the
+      // window-relative `a_start` we uploaded) — done in f64 here, so the f32 the
+      // shader receives is a small number near the view, preserving precision.
+      gl.uniform1f(this.u.u_viewT0!, this.viewT0 - this.glBaseMs);
       gl.uniform1f(this.u.u_pxPerMs!, this.pxPerMs * sx);
       gl.uniform1f(this.u.u_trackH!, this.trackH * sy);
       gl.uniform1f(this.u.u_scrollY!, this.scrollY * sy);
@@ -1057,25 +1412,11 @@ export class Timeline {
     ctx.lineWidth = 1;
     ctx.stroke();
 
-    // Scale labels in a left gutter, drawn on top with chips so they stay
-    // readable over the area.
-    ctx.font = "10px ui-monospace, Menlo, monospace";
-    ctx.textBaseline = "middle";
-    for (const f of [0, 0.5, 1]) {
-      const y = yOf(f);
-      // The 0% line is on the bottom divider; lift its label up into the band
-      // so the chip doesn't bleed into the GAP_H gap / first track.
-      const ly = f === 0 ? y - 7 : y;
-      const t = `${f * 100}%`;
-      ctx.fillStyle = "rgba(13,15,19,0.85)";
-      ctx.fillRect(AXIS_X - 4, ly - 6, 32, 12);
-      ctx.fillStyle = "#6b7280";
-      ctx.fillText(t, AXIS_X, ly);
-    }
-
     // Header row: label on the left, current % on the right (no overlap with
     // the 100% guide, which is below this row).
     const hy = top + 9;
+    ctx.font = "10px ui-monospace, Menlo, monospace";
+    ctx.textBaseline = "middle";
     ctx.fillStyle = "#8b93a3";
     ctx.fillText("CPU · gevent thread (1 core)", AXIS_X, hy);
     const pct = Math.round(this.cpuBusy(1000) * 100);
@@ -1137,10 +1478,23 @@ export class Timeline {
     ctx.font = AXIS_FONT;
     ctx.textBaseline = "middle";
 
+    // Anchor gridlines to round values of the DISPLAYED axis so a line falls on
+    // the start of each second. In relative mode that's the trace origin (the
+    // nice steps already divide/multiply 1000ms); in clock mode the origin's
+    // wall-clock time isn't a round second, so shift by the epoch's sub-step
+    // remainder to land lines on whole clock seconds.
+    const clock = this.timeMode !== "relative" && Number.isFinite(this.epochMs);
+    const phaseFor = (s: number) =>
+      clock ? -(((this.epochMs % s) + s) % s) : 0;
+    const gridStart = (s: number, phase: number) =>
+      Math.ceil((this.viewT0 - phase) / s) * s + phase;
+    const minorPhase = phaseFor(minor);
+    const stepPhase = phaseFor(step);
+
     // minor lines (batched into one path)
     ctx.strokeStyle = "rgba(120,130,150,0.07)";
     ctx.beginPath();
-    for (let t = Math.ceil(this.viewT0 / minor) * minor; ; t += minor) {
+    for (let t = gridStart(minor, minorPhase); ; t += minor) {
       const x = (t - this.viewT0) * this.pxPerMs;
       if (x > cw) break;
       if (x < 0) continue;
@@ -1151,7 +1505,7 @@ export class Timeline {
 
     // major lines + labels
     ctx.strokeStyle = "rgba(130,140,160,0.22)";
-    for (let t = Math.ceil(this.viewT0 / step) * step; ; t += step) {
+    for (let t = gridStart(step, stepPhase); ; t += step) {
       const x = (t - this.viewT0) * this.pxPerMs;
       if (x > cw) break;
       ctx.beginPath();
@@ -1162,10 +1516,96 @@ export class Timeline {
       ctx.fillText(this.formatAxis(t), x + 4, RULER_H / 2);
     }
 
+    // Pre-start: the scroll buffer before the trace began (t < 0) has no data, so
+    // tint it muted too — distinguishes "nothing here" from blank scrollable void.
+    {
+      const xOrigin = (0 - this.viewT0) * this.pxPerMs;
+      if (xOrigin > 0) {
+        ctx.fillStyle = "rgba(120,130,150,0.10)";
+        ctx.fillRect(0, RULER_H, Math.min(xOrigin, cw), ch - RULER_H);
+      }
+    }
+
+    // Loading region: visible time that DOES have data on the server but isn't in
+    // the client's current window yet — you panned/zoomed to a section that was
+    // dropped from memory, or its fetch is still in flight. Painted with the same
+    // muted diagonal hatch as the pending live edge, so an unloaded section reads
+    // as "loading…" rather than empty, and fills with real spans when the window
+    // arrives. Restricted to [origin, newest] so it never overlaps the pre-start
+    // or the live-edge pending region (each keeps its own treatment).
+    {
+      const visMs = cw / this.pxPerMs;
+      const segL = Math.max(this.viewT0, 0);
+      const segR = Math.min(this.viewT0 + visMs, this.fullSpanMs);
+      const hatch = (aMs: number, bMs: number) => {
+        const px0 = Math.max(0, (aMs - this.viewT0) * this.pxPerMs);
+        const px1 = Math.min(cw, (bMs - this.viewT0) * this.pxPerMs);
+        if (px1 <= px0) return;
+        ctx.fillStyle = "rgba(120,130,150,0.10)";
+        ctx.fillRect(px0, RULER_H, px1 - px0, ch - RULER_H);
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(px0, RULER_H, px1 - px0, ch - RULER_H);
+        ctx.clip();
+        ctx.strokeStyle = "rgba(140,150,170,0.10)";
+        for (let x = px0 - ch; x < px1; x += 9) {
+          ctx.beginPath();
+          ctx.moveTo(x, ch);
+          ctx.lineTo(x + ch, RULER_H);
+          ctx.stroke();
+        }
+        ctx.restore();
+      };
+      if (segR > segL) {
+        if (this.loadedT1 < 0) {
+          hatch(segL, segR); // nothing loaded yet (first window in flight)
+        } else {
+          const lL = (this.loadedT0 - this.originNs) / 1e6;
+          const lR = (this.loadedT1 - this.originNs) / 1e6;
+          if (lL > segL) hatch(segL, Math.min(lL, segR)); // unloaded on the left
+          if (lR < segR) hatch(Math.max(lR, segL), segR); // unloaded on the right
+        }
+      }
+    }
+
+    // Pending region: from the newest captured span up to the live edge ("now").
+    // This is the arrival lag — data that exists but hasn't streamed in yet — so
+    // it's tinted muted (not blank) to read as "pending", with a "now" edge line.
+    const liveEdge = this.liveEdgeMs();
+    if (liveEdge > this.fullSpanMs) {
+      const px0 = Math.max(0, (this.fullSpanMs - this.viewT0) * this.pxPerMs);
+      const px1 = Math.min(cw, (liveEdge - this.viewT0) * this.pxPerMs);
+      if (px1 > px0) {
+        ctx.fillStyle = "rgba(120,130,150,0.10)";
+        ctx.fillRect(px0, RULER_H, px1 - px0, ch - RULER_H);
+        // diagonal hatch for a clear "no data here yet" texture
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(px0, RULER_H, px1 - px0, ch - RULER_H);
+        ctx.clip();
+        ctx.strokeStyle = "rgba(140,150,170,0.10)";
+        for (let x = px0 - ch; x < px1; x += 9) {
+          ctx.beginPath();
+          ctx.moveTo(x, ch);
+          ctx.lineTo(x + ch, RULER_H);
+          ctx.stroke();
+        }
+        ctx.restore();
+        if (px1 <= cw) {
+          ctx.strokeStyle = "rgba(160,170,190,0.55)"; // the "now" edge
+          ctx.beginPath();
+          ctx.moveTo(px1 + 0.5, RULER_H);
+          ctx.lineTo(px1 + 0.5, ch);
+          ctx.stroke();
+        }
+      }
+    }
+
     // GC pauses: global vertical lines spanning the full height (a GC stalls the
     // whole gevent thread, so it blocks every lane at once). Hover shows
-    // gen/duration/objects in the top readout.
-    if (!isNaN(this.t0ns)) {
+    // gen/duration/objects in the top readout. The layer is toggleable (the data
+    // is still collected and counted; only its drawing is suppressed).
+    if (this.showGc && !isNaN(this.t0ns)) {
       for (let i = 0; i < this.gcStart.length; i++) {
         const sMs = (this.gcStart[i] - this.t0ns) / 1e6;
         const x0 = (sMs - this.viewT0) * this.pxPerMs;

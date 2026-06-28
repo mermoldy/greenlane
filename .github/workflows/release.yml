@@ -43,6 +43,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # For a manual run, build the exact tag being published (not the
+          # workflow-selected branch/SHA); a tag push already checks out the tag.
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2

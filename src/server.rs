@@ -6,34 +6,37 @@
 //! so you can rebuild the frontend without recompiling Rust. `--web-dir` forces
 //! serving from an arbitrary directory (e.g. when iterating outside the repo).
 //!
-//! Wire protocol (server → client, JSON text frames):
-//!   { "type": "snapshot", "slices": [Slice, ...] }   // first frame on connect
-//!   { "type": "slices",   "slices": [Slice, ...] }   // subsequent tail deltas
-//!
-//! Each client keeps a cursor; on a fixed timer the server sends the contiguous
-//! tail since that cursor (naturally coalesced to ~30 frames/s regardless of
-//! switch rate). Lossless — no broadcast lag, no resync storms.
-//!
-//! JSON is the v1 transport; swap to binary framing (postcard) when rates demand.
+//! Wire protocol (over one WebSocket). The viewer is **request-driven**: it asks
+//! for exactly the viewport it needs and the server answers from the DB.
+//!   client → server (JSON text): `{type:"viewport",t0,t1,px,req}`, `{type:"slowlog",…}`,
+//!     `{type:"stats",…}`.
+//!   server → client: a `viewport` reply is a compact **binary columnar frame**
+//!     (see `encode_window` / the TS `decodeWindow`) — typed-array columns + a small
+//!     JSON header; `slowlog`/`stats`/`meta`/`head`/`status` are JSON text.
+//! On connect the server sends a `meta` frame; while live it pushes a small `head`
+//! (span/total/bytes) on a timer so the viewer follows the edge. No server-side
+//! push of slice data — the client pulls each window, so there's no broadcast lag.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::{StatusCode, Uri, header};
+use axum::extract::{RawQuery, State};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
+use crate::Thresholds;
 use crate::db::{Db, Query, Reply};
+use crate::sysinfo::SysInfo;
 
 /// How often a live session pushes a `head` (so the viewer follows + updates the
 /// header). Recordings are static and get none.
@@ -41,9 +44,6 @@ const HEAD_TICK: Duration = Duration::from_millis(100);
 
 /// Hard cap on slices returned per viewport window (memory bound).
 const WINDOW_CAP: usize = 200_000;
-/// Slow-span thresholds (ns): warn > 20ms, red > 50ms (mirrors the renderer).
-const WARN_NS: u64 = 20_000_000;
-const RED_NS: u64 = 50_000_000;
 
 /// Provenance of an opened recording, surfaced to the viewer for context.
 #[derive(Clone)]
@@ -64,6 +64,65 @@ struct AppState {
     detached: Arc<AtomicBool>,
     /// Set when serving a `.glr` recording (vs a live attach); `None` when live.
     source: Option<Source>,
+    /// Trace mode this session captured with — `"off"`, `"slow"`, or `"all"`
+    /// (`--include-traces`). `None` for recordings, where the mode isn't known (the
+    /// viewer infers per-span from whether the stack is present). Drives the detail
+    /// panel's per-span "why no full stack" copy.
+    trace_mode: Option<&'static str>,
+    /// Host/process/runtime introspection + scheduler-lag (live attaches only).
+    sys: Option<Arc<SysInfo>>,
+    /// Warn/block span-duration thresholds (slow-log filter + sent to the viewer).
+    thresholds: Thresholds,
+    /// Per-session secret required to reach `/ws`, `/info`, `/detach`. Supplied via
+    /// the capability URL greenlane prints (`?token=…`); loading that URL sets a
+    /// same-origin cookie the browser then sends automatically. Without it, a host
+    /// reachable over the network can't read the timeline or POST `/detach`.
+    token: Arc<str>,
+    /// Whether token auth is enforced. Off in `--web-dir` dev mode, where the bun
+    /// dev server is a different origin (cross-origin → no same-origin cookie) and
+    /// CORS is already permissive for local iteration.
+    auth_enabled: bool,
+}
+
+impl AppState {
+    /// Whether a request carries the right token, via the `?token=` query param or
+    /// the `gl_token` cookie (set when the capability URL is opened).
+    fn authed(&self, raw_query: Option<&str>, headers: &header::HeaderMap) -> bool {
+        if !self.auth_enabled {
+            return true;
+        }
+        let provided = token_from_query(raw_query).or_else(|| token_from_cookie(headers));
+        // Length-then-bytes compare; the token is 128 bits of CSPRNG, so a timing
+        // side-channel isn't a practical threat here.
+        provided.as_deref() == Some(&*self.token)
+    }
+}
+
+/// Extract `token` from a raw query string. The token is hex, so no percent-decode.
+fn token_from_query(raw: Option<&str>) -> Option<String> {
+    raw?.split('&')
+        .find_map(|kv| kv.strip_prefix("token="))
+        .map(|s| s.to_string())
+}
+
+/// Extract the `gl_token` cookie value from request headers.
+fn token_from_cookie(headers: &header::HeaderMap) -> Option<String> {
+    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookies
+        .split(';')
+        .find_map(|kv| kv.trim().strip_prefix("gl_token="))
+        .map(|s| s.to_string())
+}
+
+/// 16 random bytes from the OS CSPRNG as lowercase hex (the session token).
+fn random_token() -> String {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)) {
+        Ok(()) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        // Extremely unlikely; fall back to a less-ideal but non-empty token.
+        Err(_) => format!("{:x}", std::process::id() as u64),
+    }
 }
 
 /// The built viewer bundle, embedded at compile time.
@@ -72,23 +131,34 @@ struct AppState {
 struct Assets;
 
 /// Run the viewer server until `shutdown` resolves.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     db: Db,
     pid: i32,
     detached: Arc<AtomicBool>,
     source: Option<Source>,
+    trace_mode: Option<&'static str>,
+    sys: Option<Arc<SysInfo>>,
+    thresholds: Thresholds,
     addr: SocketAddr,
     web_dir: Option<PathBuf>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
+    let token: Arc<str> = Arc::from(random_token());
     let state = AppState {
         db,
         pid,
         detached,
         source,
+        trace_mode,
+        sys,
+        thresholds,
+        token: token.clone(),
+        auth_enabled: web_dir.is_none(),
     };
     let mut app = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/info", get(info_handler))
         .route("/detach", post(detach_handler));
 
     app = match &web_dir {
@@ -96,16 +166,28 @@ pub async fn serve(
         None => app.fallback(static_handler),
     };
 
-    // CorsLayer lets the bun/vite dev server (different origin) reach /ws.
-    let app = app.layer(CorsLayer::permissive()).with_state(state);
+    // Permissive CORS only in frontend-dev mode (--web-dir), where the bun/vite
+    // dev server is a different origin. In normal use the viewer is same-origin
+    // (embedded assets) and a per-session token gates /ws|/info|/detach (see
+    // AppState::authed), so binding beyond localhost doesn't expose an open control
+    // endpoint — a caller without the token (from the printed capability URL) is
+    // rejected. (Dev mode disables the token; don't expose --web-dir publicly.)
+    let app = if web_dir.is_some() {
+        app.layer(CorsLayer::permissive())
+    } else {
+        app
+    };
+    let app = app.with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    // The capability URL — open THIS (the token authorizes /ws, /info, /detach).
+    let url = format!("http://{addr}/?token={token}");
     match &web_dir {
         Some(dir) => {
-            tracing::info!(url = %format!("http://{addr}"), assets = %dir.display(), "viewer ready")
+            tracing::info!(url = %url, assets = %dir.display(), "viewer ready — open this URL")
         }
         None => {
-            tracing::info!(url = %format!("http://{addr}"), assets = "embedded", "viewer ready")
+            tracing::info!(url = %url, assets = "embedded", "viewer ready — open this URL")
         }
     }
     axum::serve(listener, app)
@@ -115,7 +197,70 @@ pub async fn serve(
 }
 
 /// Serve an embedded asset, falling back to index.html for SPA client routing.
-async fn static_handler(uri: Uri) -> Response {
+/// Gated on the session token: an unauthenticated request (no valid `?token=` and
+/// no `gl_token` cookie) gets a **403 page** instead of the viewer, so a stray
+/// visitor sees a clear explanation rather than a viewer that can't connect. When
+/// the request carries a valid `?token=` (the capability URL greenlane prints) it
+/// also sets a same-origin `gl_token` cookie so the viewer's subsequent `/ws`,
+/// `/info`, `/detach` requests authenticate automatically.
+async fn static_handler(
+    State(st): State<AppState>,
+    RawQuery(q): RawQuery,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if !st.authed(q.as_deref(), &headers) {
+        return forbidden_page();
+    }
+    let mut resp = serve_asset(&uri);
+    if token_from_query(q.as_deref()).as_deref() == Some(&*st.token)
+        && let Ok(v) = header::HeaderValue::from_str(&format!(
+            "gl_token={}; Path=/; HttpOnly; SameSite=Strict",
+            st.token
+        ))
+    {
+        resp.headers_mut().insert(header::SET_COOKIE, v);
+    }
+    resp
+}
+
+/// A minimal self-contained 403 page (no external assets, so it renders under the
+/// viewer's strict same-origin loading). Shown when the viewer is opened without a
+/// valid session token.
+fn forbidden_page() -> Response {
+    // The GIF is embedded as a base64 `data:` URI (built from src/forbidden.gif),
+    // so the page stays fully self-contained — no external host, nothing for the
+    // strict same-origin loading / CSP to block.
+    const GIF: &str = include_str!("forbidden.gif.datauri");
+    let body = format!(
+        r#"<!doctype html>
+<meta charset="utf-8">
+<title>403 — greenlane</title>
+<style>
+  html{{color-scheme:dark light}}
+  body{{font:15px/1.6 ui-sans-serif,system-ui,sans-serif;max-width:34rem;margin:14vh auto;padding:0 1.25rem;text-align:center}}
+  h1{{font-size:1.4rem;margin:0 0 .5rem}}
+  code{{font-family:ui-monospace,Menlo,monospace;background:color-mix(in srgb,currentColor 12%,transparent);padding:.1em .35em;border-radius:4px}}
+  img{{width:200px;max-width:60%;height:auto;border-radius:10px;margin:0 0 1rem}}
+  .muted{{opacity:.7}}
+</style>
+<img src="{GIF}" alt="sad SpongeBob" width="319" height="317">
+<h1>403 — Forbidden</h1>
+<p>This greenlane viewer needs its session token.</p>
+<p class="muted">Open the capability URL greenlane printed when it started — the one
+ending in <code>?token=…</code>. The token is shown only in greenlane's own output,
+so only you can reach this viewer.</p>
+"#
+    );
+    (
+        StatusCode::FORBIDDEN,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        Body::from(body),
+    )
+        .into_response()
+}
+
+fn serve_asset(uri: &Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
 
@@ -152,12 +297,58 @@ fn mime_for(path: &str) -> &'static str {
 }
 
 /// POST /detach — stop collecting so the target removes its trace hook.
-async fn detach_handler(State(st): State<AppState>) -> StatusCode {
+async fn detach_handler(
+    State(st): State<AppState>,
+    RawQuery(q): RawQuery,
+    headers: HeaderMap,
+) -> StatusCode {
+    if !st.authed(q.as_deref(), &headers) {
+        return StatusCode::FORBIDDEN;
+    }
     st.detached.store(true, Ordering::SeqCst);
     StatusCode::OK
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(st): State<AppState>) -> Response {
+/// GET /info — host/process/runtime details + live scheduler-lag for the System
+/// panel. Recordings (no live target) report what little they have, lag `null`.
+async fn info_handler(
+    State(st): State<AppState>,
+    RawQuery(q): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    if !st.authed(q.as_deref(), &headers) {
+        return (StatusCode::FORBIDDEN, "missing or invalid session token").into_response();
+    }
+    let live = !st.detached.load(Ordering::SeqCst);
+    let source = st
+        .source
+        .as_ref()
+        .map(|s| serde_json::json!({ "file": s.file, "bytes": s.bytes }));
+    let body = match &st.sys {
+        Some(sys) => sys.to_json(live, source),
+        None => serde_json::json!({
+            "pid": st.pid,
+            "live": live,
+            "source": source,
+            "tid": serde_json::Value::Null,
+            "kernel": serde_json::Value::Null,
+            "process": serde_json::Value::Null,
+            "python": serde_json::Value::Null,
+            "lag": serde_json::Value::Null,
+        }),
+    };
+    axum::Json(body).into_response()
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(st): State<AppState>,
+    RawQuery(q): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    if !st.authed(q.as_deref(), &headers) {
+        return (StatusCode::FORBIDDEN, "missing or invalid session token").into_response();
+    }
     ws.on_upgrade(move |socket| client(socket, st))
 }
 
@@ -178,12 +369,31 @@ async fn client(mut socket: WebSocket, st: AppState) {
         "spanNs": st.db.span(),
         "totalSlices": st.db.total(),
         "bytes": st.db.bytes(),
+        // Live retention horizon (ns): in a live-view-only session old rows are
+        // evicted past a cap; data before this point is gone (0 = nothing evicted).
+        "retainedFromNs": st.db.retained_from(),
+        // Span-duration thresholds (ns) so the viewer colors/labels match the
+        // server's slow-log filter; configurable via --warn-ms/--block-ms.
+        "warnNs": st.thresholds.warn_ns,
+        "blockNs": st.thresholds.block_ns,
+        // Trace mode (--include-traces): "off" | "slow" | "all", or null for
+        // recordings (unknown). `traces` stays as a convenience bool (mode != off);
+        // the viewer uses `traceMode` for the per-span "why no full stack" copy.
+        "traces": st.trace_mode.map(|m| m != "off"),
+        "traceMode": st.trace_mode,
     });
     if send_json(&mut socket, &meta).await.is_err() {
         return;
     }
+    tracing::debug!(
+        total_slices = st.db.total(),
+        span_ns = st.db.span(),
+        live = !st.detached.load(Ordering::SeqCst),
+        "viewer connected; sent meta"
+    );
 
     let mut was_detached = st.detached.load(Ordering::SeqCst);
+    let mut last_head = (0u64, 0u64, 0u64); // (span, total, bytes) last pushed
     let mut tick = tokio::time::interval(HEAD_TICK);
 
     loop {
@@ -192,8 +402,18 @@ async fn client(mut socket: WebSocket, st: AppState) {
                 match inbound {
                     // The viewer drives data flow with viewport/slowlog/stats requests.
                     Some(Ok(Message::Text(t))) => {
-                        if let Some(reply) = handle_request(&st, &t).await
-                            && send_json(&mut socket, &reply).await.is_err()
+                        let started = Instant::now();
+                        let reply = handle_request(&st, &t).await;
+                        // One per viewport/slowlog/stats request — fires on every
+                        // pan/zoom, so trace, not debug.
+                        tracing::trace!(
+                            req = %t.chars().take(80).collect::<String>(),
+                            elapsed_ms = started.elapsed().as_secs_f64() * 1e3,
+                            replied = reply.is_some(),
+                            "served viewer request"
+                        );
+                        if let Some(reply) = reply
+                            && socket.send(reply).await.is_err()
                         {
                             break;
                         }
@@ -205,15 +425,22 @@ async fn client(mut socket: WebSocket, st: AppState) {
             _ = tick.tick() => {
                 // Live sessions push a head so the viewer follows the edge and the
                 // header (span/total/bytes) stays current; recordings are static.
+                // Skip the push when nothing changed since last tick (idle target).
                 if !st.detached.load(Ordering::SeqCst) {
-                    let head = serde_json::json!({
-                        "type": "head",
-                        "spanNs": st.db.span(),
-                        "totalSlices": st.db.total(),
-                        "bytes": st.db.bytes(),
-                    });
-                    if send_json(&mut socket, &head).await.is_err() {
-                        break;
+                    let now = (st.db.span(), st.db.total(), st.db.bytes());
+                    if now != last_head {
+                        last_head = now;
+                        let head = serde_json::json!({
+                            "type": "head",
+                            "spanNs": now.0,
+                            "totalSlices": now.1,
+                            "bytes": now.2,
+                            // Retention horizon advances as old rows evict (live cap).
+                            "retainedFromNs": st.db.retained_from(),
+                        });
+                        if send_json(&mut socket, &head).await.is_err() {
+                            break;
+                        }
                     }
                 }
                 // Notify the viewer when the session detaches.
@@ -237,34 +464,41 @@ async fn send_json(socket: &mut WebSocket, v: &serde_json::Value) -> Result<(), 
         .map_err(|_| ())
 }
 
-/// Parse a client request and run the matching DB query, returning the JSON reply.
-async fn handle_request(st: &AppState, text: &str) -> Option<serde_json::Value> {
+/// Parse a client request and run the matching DB query, returning the reply
+/// frame. The hot `window` reply is a compact **binary** frame (columnar typed
+/// arrays + a small JSON header); the small/infrequent replies stay JSON text.
+async fn handle_request(st: &AppState, text: &str) -> Option<Message> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     match v.get("type")?.as_str()? {
         "viewport" => {
             let t0 = v.get("t0")?.as_u64()?;
             let t1 = v.get("t1")?.as_u64()?;
-            let buckets = v.get("px").and_then(|x| x.as_u64()).unwrap_or(1000) as usize;
+            // Monotonic request id, echoed back so the viewer can drop superseded
+            // replies (e.g. older windows arriving mid-pan).
+            let req = v.get("req").and_then(|x| x.as_u64()).unwrap_or(0);
             let q = Query::Window {
                 t0,
                 t1,
                 cap: WINDOW_CAP,
-                buckets: buckets.clamp(1, 4096),
             };
             match st.db.query(q).await {
                 Ok(Reply::Window {
                     slices,
-                    cpu,
                     tracks,
                     gc,
                     visible,
                     capped,
-                }) => Some(serde_json::json!({
-                    "type": "window", "t0": t0, "t1": t1,
-                    "slices": slices, "cpu": cpu, "tracks": tracks, "gc": gc,
-                    "counts": { "visible": visible, "total": st.db.total() },
-                    "capped": capped, "spanNs": st.db.span(), "bytes": st.db.bytes(),
-                })),
+                    min_start,
+                    max_end,
+                }) => {
+                    debug_assert_eq!(visible, slices.len());
+                    Some(Message::Binary(
+                        encode_window(
+                            st, req, t0, t1, &slices, &tracks, &gc, capped, min_start, max_end,
+                        )
+                        .into(),
+                    ))
+                }
                 Ok(_) => None,
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), "window query failed");
@@ -274,19 +508,24 @@ async fn handle_request(st: &AppState, text: &str) -> Option<serde_json::Value> 
         }
         "slowlog" => {
             let level = v.get("level").and_then(|x| x.as_str()).unwrap_or("all");
+            let tier = match level {
+                "warn" => crate::db::SlowTier::Warn,
+                "block" => crate::db::SlowTier::Block,
+                _ => crate::db::SlowTier::All,
+            };
             let sort_dur = v.get("sort").and_then(|x| x.as_str()) == Some("dur");
             let limit = v.get("limit").and_then(|x| x.as_u64()).unwrap_or(500) as usize;
             let q = Query::Slowlog {
-                warn_ns: WARN_NS,
-                red_ns: RED_NS,
-                red_only: level == "red",
+                warn_ns: st.thresholds.warn_ns,
+                red_ns: st.thresholds.block_ns,
+                tier,
                 sort_dur,
                 limit,
             };
             match st.db.query(q).await {
-                Ok(Reply::Slowlog(rows)) => {
-                    Some(serde_json::json!({ "type": "slowlog", "rows": rows }))
-                }
+                Ok(Reply::Slowlog { rows, total }) => Some(json_msg(&serde_json::json!({
+                    "type": "slowlog", "rows": rows, "total": total,
+                }))),
                 _ => None,
             }
         }
@@ -294,14 +533,232 @@ async fn handle_request(st: &AppState, text: &str) -> Option<serde_json::Value> 
             let t0 = v.get("t0").and_then(|x| x.as_u64()).unwrap_or(0);
             // i64::MAX, not u64::MAX — the DB casts times to i64, where u64::MAX
             // wraps to -1 and would exclude every row.
-            let t1 = v.get("t1").and_then(|x| x.as_u64()).unwrap_or(i64::MAX as u64);
+            let t1 = v
+                .get("t1")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(i64::MAX as u64);
             match st.db.query(Query::Stats { t0, t1 }).await {
-                Ok(Reply::Stats { p50, p95, p99 }) => Some(serde_json::json!({
+                Ok(Reply::Stats { p50, p95, p99 }) => Some(json_msg(&serde_json::json!({
                     "type": "stats", "p50": p50, "p95": p95, "p99": p99,
-                })),
+                }))),
                 _ => None,
             }
         }
         _ => None,
+    }
+}
+
+fn json_msg(v: &serde_json::Value) -> Message {
+    Message::Text(v.to_string().into())
+}
+
+/// Encode the `window` reply as a binary frame:
+///
+/// ```text
+///   u32 LE headerLen | header JSON (utf-8) | pad→4 | columns…
+/// ```
+///
+/// The header carries the small/structured parts (counts, span, tracks, gc, and
+/// the de-duplicated func/task/stack string dictionaries). The big per-slice data
+/// is six parallel typed-array columns (no repeated strings, no per-object JSON):
+/// `startMs` f32, `durMs` f32, then `trackIdx`/`funcIdx`/`taskIdx`/`stackIdx` u32
+/// (indices into the header's `tracks` and `dict`). CPU bins aren't sent — the
+/// client derives them from these slices.
+#[allow(clippy::too_many_arguments)]
+fn encode_window(
+    st: &AppState,
+    req: u64,
+    t0: u64,
+    t1: u64,
+    slices: &[crate::store::Slice],
+    tracks: &[crate::db::TrackRun],
+    gc: &[crate::store::GcEvent],
+    capped: bool,
+    min_start: u64,
+    max_end: u64,
+) -> Vec<u8> {
+    use std::collections::HashMap;
+    let n = slices.len();
+
+    let gid_idx: HashMap<u64, u32> = tracks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.gid, i as u32))
+        .collect();
+
+    let mut func_dict: Vec<String> = Vec::new();
+    let mut func_map: HashMap<String, u32> = HashMap::new();
+    let mut task_dict: Vec<String> = Vec::new();
+    let mut task_map: HashMap<String, u32> = HashMap::new();
+    let mut stack_dict: Vec<String> = Vec::new();
+    let mut stack_map: HashMap<String, u32> = HashMap::new();
+    let intern = |s: &str, dict: &mut Vec<String>, map: &mut HashMap<String, u32>| -> u32 {
+        if let Some(&i) = map.get(s) {
+            return i;
+        }
+        let i = dict.len() as u32;
+        dict.push(s.to_string());
+        map.insert(s.to_string(), i);
+        i
+    };
+
+    let mut start = Vec::with_capacity(n);
+    let mut dur = Vec::with_capacity(n);
+    let mut trk = Vec::with_capacity(n);
+    let mut fi = Vec::with_capacity(n);
+    let mut ti = Vec::with_capacity(n);
+    let mut si = Vec::with_capacity(n);
+    for s in slices {
+        // Encode `start` as ms **relative to the window's t0**, not the global
+        // origin: offsets within a window are small, so f32 keeps sub-ms precision
+        // even hours into a capture (an absolute offset would lose it). The viewer
+        // adds back `t0 - origin` in f64 to recover the absolute position. Spans
+        // straddling t0 are negative — fine. (See wire.ts / timeline.ts.)
+        start.push(((s.start as i64 - t0 as i64) as f32) / 1e6);
+        dur.push(s.dur as f32 / 1e6);
+        trk.push(gid_idx.get(&s.gid).copied().unwrap_or(0));
+        fi.push(intern(&s.func, &mut func_dict, &mut func_map));
+        ti.push(intern(&s.task, &mut task_dict, &mut task_map));
+        si.push(intern(&s.stack, &mut stack_dict, &mut stack_map));
+    }
+
+    let header = serde_json::json!({
+        "type": "window",
+        "req": req,
+        "t0": t0, "t1": t1, "n": n,
+        "counts": { "visible": n, "total": st.db.total() },
+        "capped": capped,
+        // Absolute ns bounds of the slices actually returned (0/0 if empty), so the
+        // viewer records the range it genuinely has rather than the requested one —
+        // which overstates coverage when `capped` truncated an edge.
+        "minStart": min_start,
+        "maxEnd": max_end,
+        "spanNs": st.db.span(),
+        "bytes": st.db.bytes(),
+        // Live retention horizon (ns): data before this was evicted (0 = none).
+        "retainedFromNs": st.db.retained_from(),
+        "tracks": tracks,
+        "gc": gc,
+        "dict": { "func": func_dict, "task": task_dict, "stack": stack_dict },
+    });
+    let hbytes = header.to_string().into_bytes();
+
+    let mut buf = Vec::with_capacity(8 + hbytes.len() + n * 24);
+    buf.extend_from_slice(&(hbytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&hbytes);
+    while buf.len() % 4 != 0 {
+        buf.push(0);
+    }
+    for v in &start {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in &dur {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    for col in [&trk, &fi, &ti, &si] {
+        for v in col {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    buf
+}
+
+#[cfg(test)]
+mod tests {
+    //! The binary `window` frame is the server↔viewer contract. This asserts its
+    //! layout (u32 headerLen | JSON header | pad→4 | 6 typed-array columns) so it
+    //! stays in lockstep with the TS `decodeWindow`. Run with `cargo test`.
+    use super::*;
+    use crate::db::{Db, TrackRun};
+    use crate::store::{GcEvent, Slice};
+
+    fn app_state(db: Db) -> AppState {
+        AppState {
+            db,
+            pid: 1,
+            detached: Arc::new(AtomicBool::new(false)),
+            source: None,
+            trace_mode: Some("all"),
+            sys: None,
+            thresholds: Thresholds {
+                warn_ns: 20_000_000,
+                block_ns: 50_000_000,
+            },
+            token: Arc::from("test-token"),
+            auth_enabled: false,
+        }
+    }
+
+    #[test]
+    fn encode_window_layout_matches_decoder() {
+        let db = Db::spawn(None).unwrap();
+        let slices = vec![
+            Slice {
+                gid: 10,
+                start: 0,
+                dur: 5_000_000,
+                name: "Greenlet-1".into(),
+                func: "app.py:a:1".into(),
+                task: "t".into(),
+                stack: "app.py:a:1".into(),
+            },
+            Slice {
+                gid: 20,
+                start: 5_000_000,
+                dur: 1_000_000,
+                name: "Hub".into(),
+                func: "app.py:a:1".into(),
+                task: "".into(),
+                stack: "".into(),
+            },
+        ];
+        db.ingest_slices(slices.clone()); // sets origin/total
+        let tracks = vec![
+            TrackRun {
+                gid: 10,
+                name: "Greenlet-1".into(),
+                is_hub: false,
+                run_ns: 5_000_000,
+            },
+            TrackRun {
+                gid: 20,
+                name: "Hub".into(),
+                is_hub: true,
+                run_ns: 1_000_000,
+            },
+        ];
+        let gc = vec![GcEvent {
+            start: 1,
+            dur: 2,
+            generation: 0,
+            collected: 4,
+        }];
+        let st = app_state(db);
+
+        let buf = encode_window(
+            &st, 0, 0, 6_000_000, &slices, &tracks, &gc, false, 0, 6_000_000,
+        );
+
+        // Header: u32 LE length prefix, then JSON.
+        let hlen = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+        let header: serde_json::Value =
+            serde_json::from_slice(&buf[4..4 + hlen]).expect("header is valid JSON");
+        assert_eq!(header["n"], 2);
+        assert_eq!(header["type"], "window");
+        assert_eq!(header["capped"], false);
+        assert_eq!(header["tracks"].as_array().unwrap().len(), 2);
+        assert_eq!(header["gc"].as_array().unwrap().len(), 1);
+        // func "app.py:a:1" is shared → deduped to one dict entry.
+        assert_eq!(header["dict"]["func"].as_array().unwrap().len(), 1);
+
+        // Columns start 4-byte aligned and there are exactly six (2×f32 + 4×u32).
+        let off = (4 + hlen + 3) & !3;
+        assert_eq!(buf.len(), off + 2 /*n*/ * 4 /*bytes*/ * 6 /*cols*/);
+
+        // First column is startMs (f32, relative to the window t0=0): [0.0, 5.0].
+        let start0 = f32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        let start1 = f32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
+        assert_eq!(start0, 0.0);
+        assert_eq!(start1, 5.0);
     }
 }
