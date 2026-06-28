@@ -140,7 +140,11 @@ void main() {
   o_color = vec4(col, 1.0);
 }`;
 
-function compile(gl: WebGL2RenderingContext, type: number, src: string): WebGLShader {
+function compile(
+  gl: WebGL2RenderingContext,
+  type: number,
+  src: string,
+): WebGLShader {
   const s = gl.createShader(type)!;
   gl.shaderSource(s, src);
   gl.compileShader(s);
@@ -159,7 +163,8 @@ function trackColor(i: number): [number, number, number] {
   // [25,80) and cyan/blue/purple/magenta [165,330) — skipping red (~0/360)
   // and green (~95-155).
   const t = (i * 0.6180339887) % 1;
-  const seg1 = 55, seg2 = 165; // band widths
+  const seg1 = 55,
+    seg2 = 165; // band widths
   const pos = t * (seg1 + seg2);
   const h = pos < seg1 ? 25 + pos : 165 + (pos - seg1);
   return hsl(h, 0.55, 0.6);
@@ -169,14 +174,28 @@ function hsl(h: number, s: number, l: number): [number, number, number] {
   const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
   const m = l - c / 2;
   const [r, g, b] =
-    h < 60 ? [c, x, 0] : h < 120 ? [x, c, 0] : h < 180 ? [0, c, x]
-    : h < 240 ? [0, x, c] : h < 300 ? [x, 0, c] : [c, 0, x];
+    h < 60
+      ? [c, x, 0]
+      : h < 120
+        ? [x, c, 0]
+        : h < 180
+          ? [0, c, x]
+          : h < 240
+            ? [0, x, c]
+            : h < 300
+              ? [x, 0, c]
+              : [c, 0, x];
   return [r + m, g + m, b + m];
 }
 
-interface Attr { buf: WebGLBuffer; loc: number; size: number }
+interface Attr {
+  buf: WebGLBuffer;
+  loc: number;
+  size: number;
+}
 
-export type SortMode = "ident" | "activity" | "recent1" | "recent10" | "recent60";
+export type SortMode =
+  "ident" | "activity" | "recent1" | "recent10" | "recent60";
 
 export class Timeline {
   private gl: WebGL2RenderingContext;
@@ -193,6 +212,9 @@ export class Timeline {
   private aSlow: Attr;
   private cap = 0;
   count = 0;
+  // Max observed event end-time (ms since t0) — the capture's wall span, used
+  // for the events/sec rate. Tracked incrementally so it costs nothing.
+  private spanMs = 0;
   private cStart = new Float32Array(0);
   private cDur = new Float32Array(0);
   private cTrack = new Float32Array(0);
@@ -287,7 +309,17 @@ export class Timeline {
     if (!gl.getProgramParameter(this.prog, gl.LINK_STATUS)) {
       throw new Error("link: " + gl.getProgramInfoLog(this.prog));
     }
-    for (const n of ["u_res", "u_viewT0", "u_pxPerMs", "u_trackH", "u_scrollY", "u_rulerH", "u_minPx", "u_texW", "u_rowTex"]) {
+    for (const n of [
+      "u_res",
+      "u_viewT0",
+      "u_pxPerMs",
+      "u_trackH",
+      "u_scrollY",
+      "u_rulerH",
+      "u_minPx",
+      "u_texW",
+      "u_rowTex",
+    ]) {
       this.u[n] = gl.getUniformLocation(this.prog, n);
     }
     gl.useProgram(this.prog);
@@ -331,9 +363,15 @@ export class Timeline {
     let cap = Math.max(this.cap, INIT_CAP);
     while (cap < minCap) cap *= 2;
 
-    const s = new Float32Array(cap), d = new Float32Array(cap), t = new Float32Array(cap);
-    const c = new Float32Array(cap * 3), g = new Float64Array(cap), sl = new Float32Array(cap);
-    const fn = new Int32Array(cap), tk = new Int32Array(cap), st = new Int32Array(cap);
+    const s = new Float32Array(cap),
+      d = new Float32Array(cap),
+      t = new Float32Array(cap);
+    const c = new Float32Array(cap * 3),
+      g = new Float64Array(cap),
+      sl = new Float32Array(cap);
+    const fn = new Int32Array(cap),
+      tk = new Int32Array(cap),
+      st = new Int32Array(cap);
     s.set(this.cStart.subarray(0, this.count));
     d.set(this.cDur.subarray(0, this.count));
     t.set(this.cTrack.subarray(0, this.count));
@@ -343,17 +381,36 @@ export class Timeline {
     fn.set(this.cFunc.subarray(0, this.count));
     tk.set(this.cTask.subarray(0, this.count));
     st.set(this.cStack.subarray(0, this.count));
-    this.cStart = s; this.cDur = d; this.cTrack = t; this.cColor = c; this.cGid = g; this.cSlow = sl;
-    this.cFunc = fn; this.cTask = tk; this.cStack = st;
+    this.cStart = s;
+    this.cDur = d;
+    this.cTrack = t;
+    this.cColor = c;
+    this.cGid = g;
+    this.cSlow = sl;
+    this.cFunc = fn;
+    this.cTask = tk;
+    this.cStack = st;
 
     gl.bindVertexArray(this.vao);
-    for (const a of [this.aStart, this.aDur, this.aTrack, this.aColor, this.aSlow]) {
+    for (const a of [
+      this.aStart,
+      this.aDur,
+      this.aTrack,
+      this.aColor,
+      this.aSlow,
+    ]) {
       const nb = gl.createBuffer()!;
       gl.bindBuffer(gl.ARRAY_BUFFER, nb);
       gl.bufferData(gl.ARRAY_BUFFER, cap * a.size * 4, gl.DYNAMIC_DRAW);
       if (this.count > 0) {
         gl.bindBuffer(gl.COPY_READ_BUFFER, a.buf);
-        gl.copyBufferSubData(gl.COPY_READ_BUFFER, gl.ARRAY_BUFFER, 0, 0, this.count * a.size * 4);
+        gl.copyBufferSubData(
+          gl.COPY_READ_BUFFER,
+          gl.ARRAY_BUFFER,
+          0,
+          0,
+          this.count * a.size * 4,
+        );
       }
       gl.deleteBuffer(a.buf);
       a.buf = nb;
@@ -367,7 +424,8 @@ export class Timeline {
   addSlices(slices: Slice[]) {
     if (slices.length === 0) return;
     if (isNaN(this.t0ns)) this.t0ns = slices[0].start;
-    if (this.count + slices.length > this.cap) this.grow(this.count + slices.length);
+    if (this.count + slices.length > this.cap)
+      this.grow(this.count + slices.length);
 
     const first = this.count;
     for (const sl of slices) {
@@ -399,6 +457,8 @@ export class Timeline {
             ? 1
             : 0;
       if (this.cSlow[i] >= 1) this.slowIdx.push(i);
+      const endMs = this.cStart[i] + durMs;
+      if (endMs > this.spanMs) this.spanMs = endMs;
       this.trackRun[track] += durMs;
       if (!this.hubTrack[track]) this.addCpu(this.cStart[i], durMs);
       const [r, g, b] = this.colorOf(track);
@@ -422,15 +482,22 @@ export class Timeline {
   private subUpload(a: Attr, arr: Float32Array, first: number, n: number) {
     const gl = this.gl;
     gl.bindBuffer(gl.ARRAY_BUFFER, a.buf);
-    gl.bufferSubData(gl.ARRAY_BUFFER, first * a.size * 4, arr.subarray(first * a.size, (first + n) * a.size));
+    gl.bufferSubData(
+      gl.ARRAY_BUFFER,
+      first * a.size * 4,
+      arr.subarray(first * a.size, (first + n) * a.size),
+    );
   }
 
   private recomputeRows() {
     this.rowsDirty = false;
     if (this.rowOf.length < this.nTracks) {
-      const ro = new Float32Array(this.nTracks); ro.set(this.rowOf);
-      const rt = new Int32Array(this.nTracks); rt.set(this.rowToTrack);
-      this.rowOf = ro; this.rowToTrack = rt;
+      const ro = new Float32Array(this.nTracks);
+      ro.set(this.rowOf);
+      const rt = new Int32Array(this.nTracks);
+      rt.set(this.rowToTrack);
+      this.rowOf = ro;
+      this.rowToTrack = rt;
     }
 
     let order: number[];
@@ -448,20 +515,27 @@ export class Timeline {
       if (this.sortMode === "activity") {
         act = this.trackRun;
       } else if (this.sortMode !== "ident") {
-        const win = this.sortMode === "recent1" ? 1_000 : this.sortMode === "recent10" ? 10_000 : 60_000;
+        const win =
+          this.sortMode === "recent1"
+            ? 1_000
+            : this.sortMode === "recent10"
+              ? 10_000
+              : 60_000;
         const a = new Float64Array(this.nTracks);
         const now = this.maxT();
         const from = now - win;
         for (let i = this.count - 1; i >= 0; i--) {
           const e = this.cStart[i] + this.cDur[i];
           if (e < from) break;
-          a[this.cTrack[i]] += Math.min(e, now) - Math.max(this.cStart[i], from);
+          a[this.cTrack[i]] +=
+            Math.min(e, now) - Math.max(this.cStart[i], from);
         }
         act = a;
       }
       order = Array.from({ length: this.nTracks }, (_, i) => i);
       order.sort((a, b) => {
-        const ha = this.hubTrack[a], hb = this.hubTrack[b];
+        const ha = this.hubTrack[a],
+          hb = this.hubTrack[b];
         if (ha !== hb) return ha ? -1 : 1; // Hub(s) pinned on top
         if (act && !ha) {
           const d = (act[b] || 0) - (act[a] || 0);
@@ -469,7 +543,11 @@ export class Timeline {
         }
         const ka = trackRank(this.trackName[a]);
         const kb = trackRank(this.trackName[b]);
-        return ka[0] - kb[0] || ka[1] - kb[1] || (ka[2] < kb[2] ? -1 : ka[2] > kb[2] ? 1 : 0);
+        return (
+          ka[0] - kb[0] ||
+          ka[1] - kb[1] ||
+          (ka[2] < kb[2] ? -1 : ka[2] > kb[2] ? 1 : 0)
+        );
       });
     }
     this.forceSort = false;
@@ -486,11 +564,22 @@ export class Timeline {
     const gl = this.gl;
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.rowTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, TEX_W, rows, 0, gl.RED, gl.FLOAT, padded);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.R32F,
+      TEX_W,
+      rows,
+      0,
+      gl.RED,
+      gl.FLOAT,
+      padded,
+    );
   }
 
   reset() {
     this.count = 0;
+    this.spanMs = 0;
     this.nTracks = 0;
     this.trackOf.clear();
     this.trackName = [];
@@ -502,15 +591,24 @@ export class Timeline {
     this.placed = 0;
     this.forceSort = false;
     this.slowIdx = [];
-    this.funcTab = [""]; this.funcMap = new Map([["", 0]]);
-    this.taskTab = [""]; this.taskMap = new Map([["", 0]]);
-    this.stackTab = [""]; this.stackMap = new Map([["", 0]]);
-    this.cpuBins = new Float32Array(4096); this.nBins = 0;
-    this.gcStart = []; this.gcDur = []; this.gcGen = []; this.gcColl = [];
+    this.funcTab = [""];
+    this.funcMap = new Map([["", 0]]);
+    this.taskTab = [""];
+    this.taskMap = new Map([["", 0]]);
+    this.stackTab = [""];
+    this.stackMap = new Map([["", 0]]);
+    this.cpuBins = new Float32Array(4096);
+    this.nBins = 0;
+    this.gcStart = [];
+    this.gcDur = [];
+    this.gcGen = [];
+    this.gcColl = [];
   }
 
   /** Add GC pause events (global stalls). */
-  addGc(events: { start: number; dur: number; gen: number; collected: number }[]) {
+  addGc(
+    events: { start: number; dur: number; gen: number; collected: number }[],
+  ) {
     if (events.length === 0) return;
     if (isNaN(this.t0ns)) this.t0ns = events[0].start;
     for (const e of events) {
@@ -523,6 +621,16 @@ export class Timeline {
 
   gcCount() {
     return this.gcStart.length;
+  }
+
+  /** Mean events (greenlet switches) per second over the captured span. */
+  eventsPerSec(): number {
+    return this.spanMs > 0 ? this.count / (this.spanMs / 1000) : 0;
+  }
+
+  /** Captured wall-clock span, in milliseconds. */
+  spanMillis(): number {
+    return this.spanMs;
   }
 
   /** Index of the GC pause whose band the cursor x falls in, or -1. */
@@ -561,7 +669,11 @@ export class Timeline {
   private intern(s: string, tab: string[], map: Map<string, number>): number {
     if (!s) return 0;
     let id = map.get(s);
-    if (id === undefined) { id = tab.length; tab.push(s); map.set(s, id); }
+    if (id === undefined) {
+      id = tab.length;
+      tab.push(s);
+      map.set(s, id);
+    }
     return id;
   }
 
@@ -604,7 +716,10 @@ export class Timeline {
     const span = this.maxT();
     if (span <= 0) return;
     const w = this.canvas.clientWidth || 1000;
-    this.pxPerMs = Math.min(MAX_PXPERMS, Math.max(MIN_PXPERMS, (w * 0.96) / span));
+    this.pxPerMs = Math.min(
+      MAX_PXPERMS,
+      Math.max(MIN_PXPERMS, (w * 0.96) / span),
+    );
     // Keep follow as-is (fit must not cancel it); only reposition when paused.
     if (!this.follow) this.viewT0 = 0;
   }
@@ -657,8 +772,10 @@ export class Timeline {
     const w = Math.floor(cw * dpr);
     const h = Math.floor(ch * dpr);
     if (this.canvas.width !== w || this.canvas.height !== h) {
-      this.canvas.width = w; this.canvas.height = h;
-      this.overlay.width = w; this.overlay.height = h;
+      this.canvas.width = w;
+      this.canvas.height = h;
+      this.overlay.width = w;
+      this.overlay.height = h;
     }
     // Use the ACTUAL backing-to-CSS ratio, not dpr: floor() above can make the
     // backing not an exact dpr multiple (fractional dpr / browser zoom), and the
@@ -676,7 +793,10 @@ export class Timeline {
     const nowWall = performance.now();
     if (this.follow) {
       const m = this.maxT();
-      if (!this.wasFollowing) { this.anchorData = m; this.anchorLocal = nowWall; }
+      if (!this.wasFollowing) {
+        this.anchorData = m;
+        this.anchorLocal = nowWall;
+      }
       // Edge position is purely a function of elapsed LOCAL time → smooth.
       let edge = this.anchorData + (nowWall - this.anchorLocal);
       const drift = m - edge;
@@ -697,7 +817,11 @@ export class Timeline {
 
     // In any activity-based mode, re-rank periodically (throttled) — but only
     // while following; when paused, rows stay put so you can inspect.
-    if (this.sortMode !== "ident" && this.follow && nowWall - this.lastSortMs > 2000) {
+    if (
+      this.sortMode !== "ident" &&
+      this.follow &&
+      nowWall - this.lastSortMs > 2000
+    ) {
       this.rowsDirty = true;
       this.lastSortMs = nowWall;
     }
@@ -755,7 +879,10 @@ export class Timeline {
     const col = new Float32Array(cw);
     const visMs = cw / this.pxPerMs;
     const firstBin = Math.max(0, Math.floor(this.viewT0 / BIN_MS));
-    const lastBin = Math.min(this.nBins - 1, Math.floor((this.viewT0 + visMs) / BIN_MS));
+    const lastBin = Math.min(
+      this.nBins - 1,
+      Math.floor((this.viewT0 + visMs) / BIN_MS),
+    );
     if (lastBin >= firstBin) {
       const binPx = BIN_MS * this.pxPerMs;
       const busy = new Float32Array(cw); // busy-ms accumulated per pixel column
@@ -808,7 +935,8 @@ export class Timeline {
     ctx.beginPath();
     for (let x = 0; x < cw; x++) {
       const y = yOf(col[x]);
-      if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      if (x === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
     }
     ctx.strokeStyle = "#e8b563";
     ctx.lineWidth = 1;
@@ -968,12 +1096,14 @@ export class Timeline {
     const areaH = ch - HEADER_H;
     const total = this.nTracks * this.trackH;
     if (total > areaH) {
-      const sbW = 5, sbX = cw - sbW - 1;
+      const sbW = 5,
+        sbX = cw - sbW - 1;
       ctx.fillStyle = "rgba(255,255,255,0.05)";
       ctx.fillRect(sbX, HEADER_H, sbW, areaH);
       const thumbH = Math.max(24, (areaH * areaH) / total);
       const denom = total - areaH;
-      const thumbY = HEADER_H + (denom > 0 ? this.scrollY / denom : 0) * (areaH - thumbH);
+      const thumbY =
+        HEADER_H + (denom > 0 ? this.scrollY / denom : 0) * (areaH - thumbH);
       ctx.fillStyle = "rgba(180,190,210,0.38)";
       ctx.fillRect(sbX, thumbY, sbW, thumbH);
     }
@@ -981,33 +1111,50 @@ export class Timeline {
 
   private installInput() {
     const cv = this.canvas;
-    cv.addEventListener("wheel", (e) => {
-      e.preventDefault();
-      if (e.ctrlKey || e.metaKey) {
-        // zoom time around cursor — does NOT cancel follow (stays anchored live)
-        const tAtCursor = this.viewT0 + e.offsetX / this.pxPerMs;
-        const factor = Math.exp(-e.deltaY * ZOOM_SENS);
-        this.pxPerMs = Math.min(MAX_PXPERMS, Math.max(MIN_PXPERMS, this.pxPerMs * factor));
-        this.viewT0 = tAtCursor - e.offsetX / this.pxPerMs;
-      } else if (e.shiftKey) {
-        this.viewT0 += e.deltaY / this.pxPerMs; // pan time
-        this.follow = false;
-      } else {
-        // scroll the greenlet list vertically (keeps follow on); only a
-        // horizontal-DOMINANT wheel pans time and cancels follow.
-        const dy = e.deltaMode === 1 ? e.deltaY * this.trackH * 3 : e.deltaY * 14;
-        this.scrollY = Math.max(0, Math.min(this.maxScrollY(), this.scrollY + dy));
-        if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
-          this.viewT0 += e.deltaX / this.pxPerMs;
+    cv.addEventListener(
+      "wheel",
+      (e) => {
+        e.preventDefault();
+        if (e.ctrlKey || e.metaKey) {
+          // zoom time around cursor — does NOT cancel follow (stays anchored live)
+          const tAtCursor = this.viewT0 + e.offsetX / this.pxPerMs;
+          const factor = Math.exp(-e.deltaY * ZOOM_SENS);
+          this.pxPerMs = Math.min(
+            MAX_PXPERMS,
+            Math.max(MIN_PXPERMS, this.pxPerMs * factor),
+          );
+          this.viewT0 = tAtCursor - e.offsetX / this.pxPerMs;
+        } else if (e.shiftKey) {
+          this.viewT0 += e.deltaY / this.pxPerMs; // pan time
           this.follow = false;
+        } else {
+          // scroll the greenlet list vertically (keeps follow on); only a
+          // horizontal-DOMINANT wheel pans time and cancels follow.
+          const dy =
+            e.deltaMode === 1 ? e.deltaY * this.trackH * 3 : e.deltaY * 14;
+          this.scrollY = Math.max(
+            0,
+            Math.min(this.maxScrollY(), this.scrollY + dy),
+          );
+          if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+            this.viewT0 += e.deltaX / this.pxPerMs;
+            this.follow = false;
+          }
         }
-      }
-    }, { passive: false });
+      },
+      { passive: false },
+    );
 
-    let dragging = false, lastX = 0, lastY = 0, downX = 0, downY = 0, moved = false;
+    let dragging = false,
+      lastX = 0,
+      lastY = 0,
+      downX = 0,
+      downY = 0,
+      moved = false;
     cv.addEventListener("mousedown", (e) => {
       moved = false;
-      lastX = downX = e.offsetX; lastY = downY = e.offsetY;
+      lastX = downX = e.offsetX;
+      lastY = downY = e.offsetY;
       // Select-a-range-to-zoom when: in zoom drag-mode, Shift held, or dragging
       // on the time ruler. Otherwise a plain drag pans.
       if (this.dragMode === "zoom" || e.shiftKey || e.offsetY < RULER_H) {
@@ -1021,7 +1168,8 @@ export class Timeline {
     window.addEventListener("mouseup", () => {
       if (this.selecting) {
         this.selecting = false;
-        if (moved) this.zoomToRange(this.selStartX, this.mouseX); // drag = zoom
+        if (moved)
+          this.zoomToRange(this.selStartX, this.mouseX); // drag = zoom
         else this.onSelect(this.pickAt(downX, downY)); // click still selects span
       } else if (dragging && !moved) {
         this.onSelect(this.pickAt(downX, downY)); // a click selects the span
@@ -1031,14 +1179,16 @@ export class Timeline {
     cv.addEventListener("mousemove", (e) => {
       this.mouseX = e.offsetX;
       this.mouseY = e.offsetY;
-      if (Math.abs(e.offsetX - downX) > 3 || Math.abs(e.offsetY - downY) > 3) moved = true;
+      if (Math.abs(e.offsetX - downX) > 3 || Math.abs(e.offsetY - downY) > 3)
+        moved = true;
       if (this.selecting) {
         return; // marquee is drawn from selStartX..mouseX in the frame loop
       }
       if (dragging) {
         this.viewT0 -= (e.offsetX - lastX) / this.pxPerMs;
         this.scrollY = Math.max(0, this.scrollY - (e.offsetY - lastY));
-        lastX = e.offsetX; lastY = e.offsetY;
+        lastX = e.offsetX;
+        lastY = e.offsetY;
         // only a horizontal drag (time pan) cancels follow; vertical = list scroll
         if (Math.abs(e.offsetX - downX) > 3) this.follow = false;
         this.setHover(null);
@@ -1046,7 +1196,10 @@ export class Timeline {
         this.setHover(this.pickAt(e.offsetX, e.offsetY));
       }
     });
-    cv.addEventListener("mouseleave", () => { this.mouseX = this.mouseY = -1; this.setHover(null); });
+    cv.addEventListener("mouseleave", () => {
+      this.mouseX = this.mouseY = -1;
+      this.setHover(null);
+    });
     cv.addEventListener("dblclick", () => this.fit());
   }
 
@@ -1079,7 +1232,8 @@ export class Timeline {
       func: this.funcTab[this.cFunc[i]],
       task: this.taskTab[this.cTask[i]],
       stack: this.stackTab[this.cStack[i]],
-      x: px, y: py,
+      x: px,
+      y: py,
     };
   }
 
@@ -1105,8 +1259,13 @@ export class Timeline {
 
   /** Recent warn/slow spans (newest first) for the slow-log panel. */
   slowSpans(limit = 500): {
-    idx: number; startNs: number; durNs: number; name: string; level: number;
-    func: string; gid: number;
+    idx: number;
+    startNs: number;
+    durNs: number;
+    name: string;
+    level: number;
+    func: string;
+    gid: number;
   }[] {
     const out = [];
     for (let k = this.slowIdx.length - 1; k >= 0 && out.length < limit; k--) {
@@ -1131,11 +1290,17 @@ export class Timeline {
     const durMs = this.cDur[idx];
     const w = this.canvas.clientWidth || 1000;
     this.follow = false;
-    this.pxPerMs = Math.min(MAX_PXPERMS, Math.max(MIN_PXPERMS, (w * 0.3) / Math.max(durMs, 0.001)));
+    this.pxPerMs = Math.min(
+      MAX_PXPERMS,
+      Math.max(MIN_PXPERMS, (w * 0.3) / Math.max(durMs, 0.001)),
+    );
     this.viewT0 = Math.max(0, sMs + durMs / 2 - w / this.pxPerMs / 2);
     const row = this.rowOf[this.cTrack[idx]] ?? 0;
     const areaH = this.canvas.clientHeight - HEADER_H;
-    this.scrollY = Math.max(0, Math.min(this.maxScrollY(), row * this.trackH - areaH / 2));
+    this.scrollY = Math.max(
+      0,
+      Math.min(this.maxScrollY(), row * this.trackH - areaH / 2),
+    );
     this.onSelect(this.hoverFromIndex(idx, 0, 0));
   }
 
@@ -1145,7 +1310,10 @@ export class Timeline {
   trackLabels(): { name: string; y: number; color: string; runMs: number }[] {
     const areaH = this.canvas.clientHeight - HEADER_H;
     const firstRow = Math.max(0, Math.floor(this.scrollY / this.trackH));
-    const lastRow = Math.min(this.nTracks - 1, Math.ceil((this.scrollY + areaH) / this.trackH));
+    const lastRow = Math.min(
+      this.nTracks - 1,
+      Math.ceil((this.scrollY + areaH) / this.trackH),
+    );
     const out: { name: string; y: number; color: string; runMs: number }[] = [];
     for (let row = firstRow; row <= lastRow; row++) {
       const track = this.rowToTrack[row];

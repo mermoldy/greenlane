@@ -89,8 +89,8 @@ def _greenlane_install():
             mid = getattr(target, "minimal_ident", None)
             label = name if mid is None else "%s-%s" % (name, mid)
             frames = _frames()
-            func = _headline(frames)        # compact app-frame label
-            stack = " <- ".join(frames)     # full chain, full paths, all frames
+            func = _headline(frames)  # compact app-frame label
+            stack = " <- ".join(frames)  # full chain, full paths, all frames
             # Tab-delimited so fields may contain spaces:
             #   t_ns \t event \t origin \t target \t label \t func \t task \t stack
             line = "%d\t%s\t%d\t%d\t%s\t%s\t%s\t%s\n" % (
@@ -134,8 +134,8 @@ def _greenlane_install():
         elif phase == "stop":
             now = time.perf_counter_ns()
             line = "gc\t%d\t%d\t%d\t%d\n" % (
-                _gc_start[0] - t0,                 # start, relative to trace t0
-                now - _gc_start[0],                # pause duration (ns)
+                _gc_start[0] - t0,  # start, relative to trace t0
+                now - _gc_start[0],  # pause duration (ns)
                 info.get("generation", -1),
                 info.get("collected", 0),
             )
@@ -143,7 +143,7 @@ def _greenlane_install():
                 sock.sendall(line.encode())
             except OSError:
                 try:
-                    gc.callbacks.remove(_gc_cb)    # greenlane gone: stop tracking
+                    gc.callbacks.remove(_gc_cb)  # greenlane gone: stop tracking
                 except ValueError:
                     pass
 
@@ -151,6 +151,7 @@ def _greenlane_install():
 
     # Keep references alive past this function's scope so they aren't GC'd.
     import builtins
+
     builtins.__greenlane_sock = sock
     builtins.__greenlane_cb = _cb
     builtins.__greenlane_gc = _gc_cb

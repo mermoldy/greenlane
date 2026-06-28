@@ -38,6 +38,15 @@ use crate::store::Store;
 /// How often each viewer is sent the tail of new slices.
 const TICK: Duration = Duration::from_millis(33);
 
+/// Provenance of an opened recording, surfaced to the viewer for context.
+#[derive(Clone)]
+pub struct Source {
+    /// Path the recording was loaded from.
+    pub file: String,
+    /// On-disk size of that file, in bytes.
+    pub bytes: u64,
+}
+
 /// Shared server state.
 #[derive(Clone)]
 struct AppState {
@@ -46,6 +55,8 @@ struct AppState {
     pid: i32,
     /// Set by /detach: stops collection so the target self-uninstalls its hook.
     detached: Arc<AtomicBool>,
+    /// Set when serving a `.glr` recording (vs a live attach); `None` when live.
+    source: Option<Source>,
 }
 
 /// The built viewer bundle, embedded at compile time.
@@ -58,11 +69,17 @@ pub async fn serve(
     store: Arc<Store>,
     pid: i32,
     detached: Arc<AtomicBool>,
+    source: Option<Source>,
     addr: SocketAddr,
     web_dir: Option<PathBuf>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
-    let state = AppState { store, pid, detached };
+    let state = AppState {
+        store,
+        pid,
+        detached,
+        source,
+    };
     let mut app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/detach", post(detach_handler));
@@ -77,8 +94,12 @@ pub async fn serve(
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     match &web_dir {
-        Some(dir) => println!("greenlane: viewer at http://{addr}  (serving {})", dir.display()),
-        None => println!("greenlane: viewer at http://{addr}  (embedded assets)"),
+        Some(dir) => {
+            tracing::info!(url = %format!("http://{addr}"), assets = %dir.display(), "viewer ready")
+        }
+        None => {
+            tracing::info!(url = %format!("http://{addr}"), assets = "embedded", "viewer ready")
+        }
     }
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
@@ -94,7 +115,11 @@ async fn static_handler(uri: Uri) -> Response {
     match Assets::get(path).or_else(|| Assets::get("index.html")) {
         Some(content) => {
             let mime = mime_for(path);
-            ([(header::CONTENT_TYPE, mime)], Body::from(content.data.into_owned())).into_response()
+            (
+                [(header::CONTENT_TYPE, mime)],
+                Body::from(content.data.into_owned()),
+            )
+                .into_response()
         }
         None => (
             StatusCode::NOT_FOUND,
@@ -137,8 +162,20 @@ async fn client(mut socket: WebSocket, st: AppState) {
         "pid": st.pid,
         "epochMs": st.store.epoch(),
         "live": !st.detached.load(Ordering::SeqCst),
+        // Provenance for opened recordings (file name + on-disk size); null when
+        // this is a live attach, so the viewer can distinguish the two.
+        "source": st.source.as_ref().map(|s| serde_json::json!({
+            "file": s.file,
+            "bytes": s.bytes,
+        })),
+        // Raw event-stream bytes processed so far (live data volume).
+        "bytes": st.store.bytes(),
     });
-    if socket.send(Message::Text(meta.to_string().into())).await.is_err() {
+    if socket
+        .send(Message::Text(meta.to_string().into()))
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -162,7 +199,11 @@ async fn client(mut socket: WebSocket, st: AppState) {
                 if !batch.is_empty() || first {
                     let kind = if first { "snapshot" } else { "slices" };
                     first = false;
-                    let msg = serde_json::json!({ "type": kind, "slices": batch });
+                    // Piggyback the running byte total so the header's live data
+                    // volume updates in step with the timeline.
+                    let msg = serde_json::json!({
+                        "type": kind, "slices": batch, "bytes": st.store.bytes(),
+                    });
                     if socket.send(Message::Text(msg.to_string().into())).await.is_err() {
                         break;
                     }

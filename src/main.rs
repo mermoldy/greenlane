@@ -5,30 +5,33 @@
 //!   2. Inject `bootstrap.py` into the target via `sys.remote_exec` (PEP 768,
 //!      CPython 3.14+). The bootstrap registers a `greenlet.settrace` hook and
 //!      streams switch events back to us over that socket.
-//!   3. Either print a live CLI summary, or (`--serve`) feed the events into a
-//!      timeline store and serve a live web viewer over HTTP.
+//!   3. Either record the events into a timeline store and serialize it to a
+//!      `.glr` file (default), or (`--serve`) serve a live web viewer over HTTP.
+//!      A recorded file is reopened later with `greenlane open <file>`.
 
+mod record;
 mod server;
 mod store;
 
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
 
 use store::{GcEvent, Slice, Store};
 
-/// bootstrap.py with a `__SOCKET_PATH__` placeholder we substitute at runtime.
-const BOOTSTRAP_TEMPLATE: &str = include_str!("bootstrap.py");
+/// bootstrap_gevent.py with a `__SOCKET_PATH__` placeholder we substitute at runtime.
+const BOOTSTRAP_TEMPLATE: &str = include_str!("bootstrap_gevent.py");
 
 #[derive(Parser)]
 #[command(
@@ -36,60 +39,137 @@ const BOOTSTRAP_TEMPLATE: &str = include_str!("bootstrap.py");
     about = "Attach to a running gevent process and profile greenlet switches"
 )]
 struct Cli {
+    /// Log output format. `text` is human-readable; `json` emits one JSON
+    /// object per line for ingestion by a log pipeline.
+    #[arg(long, value_enum, default_value_t = LogFormat::Text, global = true)]
+    log_format: LogFormat,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
+/// How diagnostics are rendered. The level filter is independent — set it with
+/// the standard `RUST_LOG` env var (defaults to `info`).
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
+}
+
+/// Parse a viewer listen address, accepting friendly shorthands: a bare port
+/// (`8080`) or `:8080` both bind `127.0.0.1`; a full `host:port` is taken as-is
+/// (use `0.0.0.0:8080` to expose on the network).
+fn parse_listen_addr(s: &str) -> Result<SocketAddr, String> {
+    let candidate = if s.parse::<u16>().is_ok() {
+        format!("127.0.0.1:{s}")
+    } else if let Some(port) = s.strip_prefix(':') {
+        format!("127.0.0.1:{port}")
+    } else {
+        s.to_string()
+    };
+    candidate
+        .parse()
+        .map_err(|e| format!("invalid listen address {s:?}: {e}"))
+}
+
+/// Install the global tracing subscriber. Honors `RUST_LOG` (falling back to
+/// `info`) and writes to stderr so stdout stays free for any future piped output.
+fn init_logging(format: LogFormat) {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
+    match format {
+        LogFormat::Json => builder.json().init(),
+        LogFormat::Text => builder.with_target(false).init(),
+    }
+}
+
 #[derive(Subcommand)]
 enum Cmd {
-    /// Attach to a running Python/gevent process by PID.
+    /// Attach to a running Python/gevent process by PID and record its timeline.
+    ///
+    /// By default the timeline is written to a `.glr` file (open it later with
+    /// `greenlane open`). Pass `--serve` to watch it live in the browser; pass
+    /// both to watch live *and* save the session on exit.
     Attach {
         /// Target process PID.
         pid: i32,
         /// Python interpreter used to trigger `sys.remote_exec` (must be 3.14+).
         #[arg(long, default_value = "python3")]
         python: String,
-        /// Seconds between live summary prints (CLI mode only).
-        #[arg(long, default_value_t = 2)]
-        interval: u64,
         /// Skip sys.remote_exec; just listen and print the bootstrap to load
         /// manually. Use on hosts where remote attach is blocked (e.g. macOS
         /// task-port restrictions) and you self-instrument your app instead.
         #[arg(long)]
         no_inject: bool,
-        /// Serve the live web viewer at this address instead of printing to the
-        /// terminal, e.g. `127.0.0.1:8080`. Bind to localhost unless you mean
-        /// to expose the profiler on the network.
-        #[arg(long)]
+        /// Serve the live web viewer. Pass bare (`--serve` → `127.0.0.1:8080`),
+        /// a port (`--serve 9000` / `--serve :9000`), or a full address
+        /// (`--serve 0.0.0.0:8080` to expose on the network). Omit entirely to
+        /// record to a file instead.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "127.0.0.1:8080",
+            value_parser = parse_listen_addr,
+        )]
         serve: Option<SocketAddr>,
+        /// Write the recording to this path. Defaults to `greenlane-<pid>.glr`
+        /// when not serving; ignored-unless-set when `--serve` is given (in
+        /// which case it also saves the live session to the file on exit).
+        #[arg(long)]
+        out: Option<PathBuf>,
         /// Serve viewer assets from this directory instead of the ones embedded
         /// in the binary (for frontend iteration).
+        #[arg(long)]
+        web_dir: Option<PathBuf>,
+    },
+
+    /// Open a recorded `.glr` timeline in the web viewer (static, not live).
+    Open {
+        /// Path to a `.glr` file written by `greenlane attach`.
+        file: PathBuf,
+        /// Address to serve the viewer at. Accepts a port, `:port`, or a full
+        /// `host:port` (see `attach --serve`).
+        #[arg(long, default_value = "127.0.0.1:8080", value_parser = parse_listen_addr)]
+        serve: SocketAddr,
+        /// Serve viewer assets from this directory instead of the embedded ones.
         #[arg(long)]
         web_dir: Option<PathBuf>,
     },
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().cmd {
+    let cli = Cli::parse();
+    init_logging(cli.log_format);
+    match cli.cmd {
         Cmd::Attach {
             pid,
             python,
-            interval,
             no_inject,
             serve,
+            out,
             web_dir,
-        } => attach(pid, &python, interval, no_inject, serve, web_dir),
+        } => attach(pid, &python, no_inject, serve, out, web_dir),
+        Cmd::Open {
+            file,
+            serve,
+            web_dir,
+        } => open(&file, serve, web_dir),
     }
 }
 
 fn attach(
     pid: i32,
     python: &str,
-    interval: u64,
     no_inject: bool,
     serve: Option<SocketAddr>,
+    out: Option<PathBuf>,
     web_dir: Option<PathBuf>,
 ) -> Result<()> {
+    // Fail fast with a clear message if there's nothing to attach to, rather
+    // than letting the failure surface later as an opaque remote_exec error.
+    ensure_pid_exists(pid)?;
+
     // Use a shared, world-accessible dir (NOT $TMPDIR): under `sudo` greenlane
     // runs as root while the target runs as the invoking user, so both the
     // socket and bootstrap must be reachable across that uid boundary.
@@ -102,7 +182,7 @@ fn attach(
     // Let the (possibly non-root) target connect back to a root-owned socket.
     std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o777))?;
     listener.set_nonblocking(true)?;
-    println!("greenlane: listening on {}", sock_path.display());
+    info!(socket = %sock_path.display(), "listening for target connection");
 
     let running = Arc::new(AtomicBool::new(true));
     {
@@ -113,14 +193,14 @@ fn attach(
 
     let bootstrap_path = write_bootstrap(pid, &base, &sock_path)?;
     if no_inject {
-        println!(
-            "greenlane: --no-inject — load this into the target yourself, e.g.\n    \
+        info!(
+            "--no-inject — load this into the target yourself, e.g.\n    \
              exec(open({:?}).read())\nwaiting for connection…",
             bootstrap_path.to_string_lossy()
         );
     } else {
         inject(python, pid, &bootstrap_path)?;
-        println!("greenlane: injected bootstrap into pid {pid}, waiting for connection…");
+        info!(pid, "injected bootstrap; waiting for connection…");
     }
 
     // Wait for the target to connect back (it runs remote_exec at its next safe point).
@@ -132,18 +212,37 @@ fn attach(
         }
     };
 
+    // Where (if anywhere) to save: an explicit --out always wins; otherwise a
+    // record-only attach (no --serve) defaults to `greenlane-<pid>.glr`.
+    let out_path = match (&serve, out) {
+        (_, Some(p)) => Some(p),
+        (None, None) => Some(PathBuf::from(format!("greenlane-{pid}.glr"))),
+        (Some(_), None) => None,
+    };
+
+    // Both modes feed the same timeline store; --serve also streams it live.
+    let store = Store::new();
     let result = match serve {
         Some(addr) => {
-            println!("greenlane: connected — streaming to viewer (Ctrl-C to stop)");
-            serve_mode(stream, running.clone(), pid, addr, web_dir)
+            info!("connected — streaming to viewer (Ctrl-C to stop)");
+            serve_mode(stream, running.clone(), pid, addr, web_dir, store.clone())
         }
         None => {
-            println!("greenlane: connected — collecting greenlet switches (Ctrl-C to stop)\n");
-            collect(stream, &running, interval)
+            let path = out_path
+                .as_ref()
+                .expect("record mode always has an out path");
+            info!(path = %path.display(), "connected — recording (Ctrl-C to stop)");
+            record_to_file(stream, &running, &store, pid, path)
         }
     };
     cleanup(&sock_path, &bootstrap_path);
-    result
+    result?;
+
+    if let Some(path) = out_path {
+        record::write(&path, &store.export(pid))?;
+        info!("wrote recording — open it with: greenlane open {}", path.display());
+    }
+    Ok(())
 }
 
 /// Materialize bootstrap.py with the real socket path baked in.
@@ -156,6 +255,34 @@ fn write_bootstrap(pid: i32, base: &PathBuf, sock_path: &PathBuf) -> Result<Path
     // Readable by the target even when greenlane wrote it as root under sudo.
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
     Ok(path)
+}
+
+/// Verify the target PID is a live process before we set anything up. Uses
+/// `kill(pid, 0)`, which probes for existence without delivering a signal:
+/// `ESRCH` means no such process, `EPERM` means it exists but is owned by
+/// another user (still attachable under sudo / as that user).
+fn ensure_pid_exists(pid: i32) -> Result<()> {
+    if pid <= 0 {
+        bail!("Invalid PID {pid}: expected a positive process id.");
+    }
+    // Safe: kill with signal 0 performs no action other than error checking.
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ESRCH) => bail!(
+            "No process with PID {pid} is running.\n\
+             Check the PID with `ps -p {pid}` or `pgrep -fl python`, then retry\n\
+             with the correct process id."
+        ),
+        // Process exists but we can't signal it — that's a privilege issue, not
+        // a missing target. Let attach proceed; inject() will give the precise
+        // platform-specific permission guidance if it really is blocked.
+        Some(libc::EPERM) => Ok(()),
+        _ => Err(err).with_context(|| format!("checking whether PID {pid} exists")),
+    }
 }
 
 /// Trigger `sys.remote_exec` from a helper interpreter. Shelling out is the
@@ -172,16 +299,137 @@ fn inject(python: &str, pid: i32, bootstrap_path: &PathBuf) -> Result<()> {
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!(
-            "sys.remote_exec failed (exit {:?}).\n\
-             Common causes: target/helper Python < 3.14; insufficient privileges \
-             (try sudo, or matching uid); remote debugging disabled \
-             (PYTHON_DISABLE_REMOTE_DEBUG / -X disable_remote_debug).\n\
-             stderr:\n{stderr}",
-            out.status.code()
+            "{}",
+            diagnose_inject_failure(pid, out.status.code(), &stderr)
         );
     }
     Ok(())
 }
+
+/// Turn a raw `sys.remote_exec` failure into an actionable, platform-specific
+/// message. We classify by signatures in the target interpreter's stderr so the
+/// hint points at the one fix that actually applies, rather than a generic list.
+fn diagnose_inject_failure(pid: i32, exit: Option<i32>, stderr: &str) -> String {
+    let lower = stderr.to_lowercase();
+
+    // 1. Privilege / OS-level process-access denial. On macOS this surfaces as a
+    //    failure to obtain the Mach task port; on Linux as ptrace/EPERM.
+    let is_perm = lower.contains("permissionerror")
+        || lower.contains("task port")
+        || lower.contains("kern_return_t")
+        || lower.contains("operation not permitted")
+        || lower.contains("ptrace")
+        || lower.contains("eperm");
+
+    // 2. Remote debugging compiled/configured off in the target.
+    let is_disabled = lower.contains("remote") && lower.contains("disabled")
+        || lower.contains("disable_remote_debug")
+        || lower.contains("remote debugging is not enabled")
+        || lower.contains("remote debugging is disabled");
+
+    // 3. Target interpreter too old for PEP 768 (sys.remote_exec is 3.14+).
+    let is_too_old = lower.contains("no attribute 'remote_exec'")
+        || lower.contains("has no attribute \"remote_exec\"")
+        || lower.contains("module 'sys' has no attribute");
+
+    let mut msg = format!("Failed to inject into PID {pid} (sys.remote_exec exited {exit:?}).\n");
+
+    let hint = if is_too_old {
+        "\nCause: the target (or the helper interpreter) is older than Python 3.14.\n\
+         sys.remote_exec / PEP 768 remote debugging requires CPython 3.14+ on both\n\
+         the target process and the `--python` helper greenlane shells out to.\n\
+         Fix: run the target under Python 3.14+, or point greenlane at a 3.14+\n\
+         interpreter with `--python /path/to/python3.14`."
+            .to_string()
+    } else if is_disabled {
+        "\nCause: remote debugging is turned off in the target interpreter.\n\
+         Fix: ensure the target was NOT started with `-X disable_remote_debug` and\n\
+         that `PYTHON_DISABLE_REMOTE_DEBUG` is unset in its environment. Also confirm\n\
+         CPython wasn't built with `--without-remote-debug`."
+            .to_string()
+    } else if is_perm {
+        format!(
+            "\nCause: insufficient privileges to attach to PID {pid}.\n\
+             greenlane must be able to access the target process, and the OS\n\
+             guards that access.\n\
+             {}",
+            platform_permission_hint()
+        )
+    } else {
+        format!(
+            "\nCommon causes: target/helper Python < 3.14; insufficient privileges;\n\
+             remote debugging disabled (PYTHON_DISABLE_REMOTE_DEBUG /\n\
+             -X disable_remote_debug).\n\
+             {}",
+            platform_permission_hint()
+        )
+    };
+
+    msg.push_str(&hint);
+    if !stderr.trim().is_empty() {
+        msg.push_str("\n\nTarget stderr:\n");
+        for line in stderr.trim_end().lines() {
+            msg.push_str("  ");
+            msg.push_str(line);
+            msg.push('\n');
+        }
+    }
+    msg
+}
+
+/// Per-OS guidance for granting greenlane access to another process.
+fn platform_permission_hint() -> String {
+    if cfg!(target_os = "macos") {
+        MACOS_PERMISSION_HINT.to_string()
+    } else if cfg!(target_os = "linux") {
+        LINUX_PERMISSION_HINT.to_string()
+    } else {
+        "Run greenlane with elevated privileges (e.g. sudo), or as the same user \
+         that owns the target process."
+            .to_string()
+    }
+}
+
+const MACOS_PERMISSION_HINT: &str = r#"macOS: obtaining a target's Mach task port requires elevated rights.
+The simplest fix is to run greenlane with sudo:
+
+    sudo greenlane attach <PID> ...
+
+To avoid sudo on every run, the greenlane binary can carry the
+`com.apple.system-task-ports` entitlement and be code-signed. For local
+development you can self-sign it:
+
+    cat > gl.entitlements <<'EOF'
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+      "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0"><dict>
+      <key>com.apple.system-task-ports</key><true/>
+    </dict></plist>
+    EOF
+    codesign -s - -f --entitlements gl.entitlements ./target/debug/greenlane
+
+Note: `com.apple.system-task-ports` is an Apple-private entitlement, so on a
+stock (SIP-enabled) machine a self-signed binary may still be denied; running
+under sudo is the reliable path. The target must also be owned by the same
+user as greenlane (or run greenlane as that user / root)."#;
+
+const LINUX_PERMISSION_HINT: &str = r#"Linux: attaching requires permission to ptrace the target. Options:
+
+  1. Run greenlane as root, or as the same user that owns the target:
+
+         sudo greenlane attach <PID> ...
+
+  2. Grant the ptrace capability to the binary (no sudo per run):
+
+         sudo setcap cap_sys_ptrace+ep $(command -v greenlane)
+
+  3. Relax the Yama ptrace_scope restriction (system-wide; prefer 1 or 2):
+
+         sudo sysctl kernel.yama.ptrace_scope=0
+
+If the target runs inside a container, its process must also be visible from
+greenlane's PID namespace."#;
 
 /// Poll the nonblocking listener until the target connects or the user aborts.
 fn accept(listener: &UnixListener, running: &AtomicBool) -> Result<Option<UnixStream>> {
@@ -197,10 +445,10 @@ fn accept(listener: &UnixListener, running: &AtomicBool) -> Result<Option<UnixSt
     Ok(None)
 }
 
-/// One greenlet switch parsed from the event stream.
+/// One greenlet switch parsed from the event stream. A `throw` (greenlet killed
+/// via `throw()`) is also a context switch, so we attribute it the same way.
 struct SwitchEvent {
     ts: u64,
-    throw: bool,
     target: u64,
     label: String,
     func: String,
@@ -213,7 +461,7 @@ struct SwitchEvent {
 fn parse_event(line: &str) -> Option<SwitchEvent> {
     let mut parts = line.split('\t');
     let ts = parts.next()?.parse::<u64>().ok()?;
-    let event = parts.next()?;
+    let _event = parts.next()?;
     let _origin = parts.next()?;
     let target = parts.next()?.parse::<u64>().ok()?;
     let label = parts.next().unwrap_or("").to_string();
@@ -222,7 +470,6 @@ fn parse_event(line: &str) -> Option<SwitchEvent> {
     let stack = parts.next().unwrap_or("").to_string();
     Some(SwitchEvent {
         ts,
-        throw: event == "throw",
         target,
         label,
         func,
@@ -254,8 +501,8 @@ fn serve_mode(
     pid: i32,
     addr: SocketAddr,
     web_dir: Option<PathBuf>,
+    store: Arc<Store>,
 ) -> Result<()> {
-    let store = Store::new();
     // Flipped by POST /detach: stops the collector so the target self-removes
     // its trace hook (the broken socket triggers cleanup in the bootstrap).
     let detached = Arc::new(AtomicBool::new(false));
@@ -267,7 +514,7 @@ fn serve_mode(
         let store = store.clone();
         std::thread::spawn(move || {
             if let Err(e) = read_slices(stream, &running, &detached, &store) {
-                eprintln!("greenlane: collector error: {e:#}");
+                error!(error = format!("{e:#}"), "collector error");
             }
         })
     };
@@ -284,7 +531,8 @@ fn serve_mode(
                 }
             }
         };
-        server::serve(store, pid, detached.clone(), addr, web_dir, shutdown).await
+        // Live attach: no recording source.
+        server::serve(store, pid, detached.clone(), None, addr, web_dir, shutdown).await
     })?;
 
     running.store(false, Ordering::SeqCst);
@@ -292,9 +540,55 @@ fn serve_mode(
     Ok(())
 }
 
+/// How often a recording session reports progress and flushes a partial file.
+const RECORD_REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Drive a record-only session: drain the event stream on a worker thread while
+/// this thread periodically reports progress and flushes a partial recording to
+/// disk, so a hard kill (not just Ctrl-C) still leaves a usable `.glr`.
+fn record_to_file(
+    stream: UnixStream,
+    running: &Arc<AtomicBool>,
+    store: &Arc<Store>,
+    pid: i32,
+    path: &Path,
+) -> Result<()> {
+    // No detach concept off-server; an empty flag keeps read_slices' signature.
+    let no_detach = Arc::new(AtomicBool::new(false));
+    let collector = {
+        let running = running.clone();
+        let store = store.clone();
+        std::thread::spawn(move || read_slices(stream, &running, &no_detach, &store))
+    };
+
+    let mut next = Instant::now() + RECORD_REPORT_INTERVAL;
+    while running.load(Ordering::SeqCst) && !collector.is_finished() {
+        std::thread::sleep(Duration::from_millis(200));
+        if Instant::now() >= next {
+            flush_and_report(store, pid, path);
+            next += RECORD_REPORT_INTERVAL;
+        }
+    }
+    // Stop the collector if it's still running (Ctrl-C), then surface its result.
+    running.store(false, Ordering::SeqCst);
+    collector
+        .join()
+        .map_err(|_| anyhow::anyhow!("recording collector thread panicked"))?
+}
+
+/// Flush the current timeline to `path` and log event count + on-disk size.
+fn flush_and_report(store: &Store, pid: i32, path: &Path) {
+    if let Err(e) = record::write(path, &store.export(pid)) {
+        warn!(error = %format!("{e:#}"), "failed to flush partial recording");
+        return;
+    }
+    let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    info!(events = store.slice_count(), bytes, "recording…");
+}
+
 /// Read the switch stream, closing one [`Slice`] per run-interval into the store.
-/// A greenlet's slice closes when the *next* switch arrives (same attribution as
-/// the CLI summary): time from being switched-in until being switched-away.
+/// A greenlet's slice closes when the *next* switch arrives: the time from being
+/// switched-in until being switched-away is attributed to whoever was running.
 fn read_slices(
     stream: UnixStream,
     running: &AtomicBool,
@@ -312,10 +606,13 @@ fn read_slices(
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => {
-                println!("greenlane: target closed the connection");
+                info!("target closed the connection");
                 break;
             }
-            Ok(_) => {
+            Ok(n) => {
+                // Count the raw stream volume processed (reported live in the
+                // viewer header), regardless of how the line parses.
+                store.add_bytes(n);
                 let trimmed = line.trim_end();
                 // Header line: "meta\t<epoch_ms>" — wall-clock at trace t0.
                 if let Some(rest) = trimmed.strip_prefix("meta\t") {
@@ -355,109 +652,47 @@ fn read_slices(
     Ok(())
 }
 
-// ── CLI summary mode ───────────────────────────────────────────────────────
+// ── Open a recorded timeline ───────────────────────────────────────────────
 
-/// Per-greenlet aggregation derived from the switch stream.
-#[derive(Default)]
-struct Stats {
-    total: u64,
-    throws: u64,
-    /// Greenlet currently running (last switch target) and when it began.
-    current: Option<u64>,
-    last_ts_ns: Option<u64>,
-    /// id -> nanoseconds spent running.
-    run_ns: HashMap<u64, u64>,
-    /// id -> times switched into.
-    switches_in: HashMap<u64, u64>,
-    /// id -> human label (type name + minimal_ident), e.g. "Hub", "Greenlet-3".
-    ident: HashMap<u64, String>,
-}
+/// Load a `.glr` recording and serve the viewer over it. No collector and no
+/// target connection — the store is fully populated up front and the session
+/// is reported as detached (static), so the viewer renders it without trying
+/// to stream more.
+fn open(file: &Path, addr: SocketAddr, web_dir: Option<PathBuf>) -> Result<()> {
+    let bytes = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+    let rec = record::read(file)?;
+    let pid = rec.pid;
+    let n = rec.slices.len();
+    let store = Store::from_recording(rec);
+    info!(slices = n, bytes, file = %file.display(), "loaded recording");
+    let source = Some(server::Source {
+        file: file.display().to_string(),
+        bytes,
+    });
 
-impl Stats {
-    fn record(&mut self, ev: &SwitchEvent) {
-        self.total += 1;
-        if ev.throw {
-            self.throws += 1;
-        }
-        // Attribute the elapsed slice to whoever was running until now.
-        if let (Some(cur), Some(prev_ts)) = (self.current, self.last_ts_ns) {
-            *self.run_ns.entry(cur).or_default() += ev.ts.saturating_sub(prev_ts);
-        }
-        self.current = Some(ev.target);
-        self.last_ts_ns = Some(ev.ts);
-        *self.switches_in.entry(ev.target).or_default() += 1;
-        if !ev.label.is_empty() {
-            self.ident
-                .entry(ev.target)
-                .or_insert_with(|| ev.label.clone());
-        }
+    let running = Arc::new(AtomicBool::new(true));
+    {
+        let r = running.clone();
+        ctrlc::set_handler(move || r.store(false, Ordering::SeqCst))
+            .context("installing SIGINT handler")?;
     }
+    // A recording is never live; mark it detached so the viewer shows it static.
+    let detached = Arc::new(AtomicBool::new(true));
 
-    fn print_summary(&self, wall: Duration) {
-        let secs = wall.as_secs_f64().max(1e-9);
-        println!(
-            "── {} switches ({} throws) in {:.1}s · {:.0}/s · {} greenlets seen",
-            self.total,
-            self.throws,
-            secs,
-            self.total as f64 / secs,
-            self.switches_in.len(),
-        );
-        let mut top: Vec<_> = self.run_ns.iter().collect();
-        top.sort_by(|a, b| b.1.cmp(a.1));
-        for (id, ns) in top.into_iter().take(10) {
-            let label = self
-                .ident
-                .get(id)
-                .cloned()
-                .unwrap_or_else(|| format!("0x{id:x}"));
-            let switches = self.switches_in.get(id).copied().unwrap_or(0);
-            println!(
-                "   {:<14} {:>8.1} ms running  {:>7} switches-in",
-                label,
-                *ns as f64 / 1e6,
-                switches,
-            );
-        }
-        println!();
-    }
-}
-
-fn collect(stream: UnixStream, running: &AtomicBool, interval: u64) -> Result<()> {
-    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
-    let mut reader = BufReader::new(stream);
-    let mut stats = Stats::default();
-    let start = Instant::now();
-    let mut last_print = Instant::now();
-    let mut line = String::new();
-
-    while running.load(Ordering::SeqCst) {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
-                println!("greenlane: target closed the connection");
-                break;
-            }
-            Ok(_) => {
-                if let Some(ev) = parse_event(line.trim_end()) {
-                    stats.record(&ev);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let shutdown = {
+            let running = running.clone();
+            async move {
+                while running.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(e) => return Err(e).context("reading event stream"),
-        }
-        if last_print.elapsed() >= Duration::from_secs(interval) {
-            stats.print_summary(start.elapsed());
-            last_print = Instant::now();
-        }
-    }
-
-    println!("\n=== final profile ===");
-    stats.print_summary(start.elapsed());
+        };
+        server::serve(store, pid, detached, source, addr, web_dir, shutdown).await
+    })?;
     Ok(())
 }
 
