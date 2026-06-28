@@ -158,11 +158,14 @@ function compile(
 // spans are red — so greenlet hues are mapped to bands that avoid both.
 const HUB_COLOR: [number, number, number] = [163 / 255, 190 / 255, 140 / 255];
 
-function trackColor(i: number): [number, number, number] {
-  // Golden-angle spread, but remapped into allowed hue bands: orange/yellow
-  // [25,80) and cyan/blue/purple/magenta [165,330) — skipping red (~0/360)
-  // and green (~95-155).
-  const t = (i * 0.6180339887) % 1;
+// Stable lane color keyed off the greenlet NAME (not insertion index), so a
+// greenlet keeps its hue even as windows are swapped in and out of memory.
+// Remapped into allowed hue bands: orange/yellow [25,80) and cyan/blue/purple/
+// magenta [165,330) — skipping red (~0/360) and green (~95-155).
+function colorForName(name: string): [number, number, number] {
+  let acc = 0;
+  for (let i = 0; i < name.length; i++) acc = (acc * 31 + name.charCodeAt(i)) >>> 0;
+  const t = (acc % 100003) / 100003;
   const seg1 = 55,
     seg2 = 165; // band widths
   const pos = t * (seg1 + seg2);
@@ -283,6 +286,21 @@ export class Timeline {
   private anchorData = 0;
   private anchorLocal = 0;
   private wasFollowing = false;
+
+  // ── Viewport windowing ────────────────────────────────────────────────
+  // Only the visible window's slices live in memory; the server is queried as
+  // the view changes. A FIXED global origin (ns, from server meta) keeps view
+  // coordinates stable across window swaps; `fullSpanMs` is the whole capture's
+  // extent (for fit/follow) even though we hold only a window.
+  private originNs = 0;
+  private originSet = false;
+  fullSpanMs = 0;
+  /** Fired (throttled) when the visible range changes → app requests that window.
+   *  Args: absolute t0/t1 in ns, and canvas width in px. */
+  onViewport: ((t0ns: number, t1ns: number, px: number) => void) | null = null;
+  private lastVpMs = 0;
+  private firedViewT0 = NaN;
+  private firedPxPerMs = NaN;
 
   private mouseX = -1;
   private mouseY = -1;
@@ -585,7 +603,7 @@ export class Timeline {
     this.trackName = [];
     this.hubTrack = [];
     this.trackRun = [];
-    this.t0ns = NaN;
+    this.t0ns = this.originSet ? this.originNs : NaN;
     this.fitted = false;
     this.rowsDirty = false;
     this.placed = 0;
@@ -680,7 +698,7 @@ export class Timeline {
   /** Lane color: the Hub is always the reserved green; everything else gets a
    *  non-red, non-green hue. */
   private colorOf(track: number): [number, number, number] {
-    return this.hubTrack[track] ? HUB_COLOR : trackColor(track);
+    return this.hubTrack[track] ? HUB_COLOR : colorForName(this.trackName[track] ?? "");
   }
 
   private maxT(): number {
@@ -733,6 +751,62 @@ export class Timeline {
 
   setTimeMode(m: "relative" | "current" | "utc") {
     this.timeMode = m;
+  }
+
+  /** Fix the global time origin (ns). All windows are positioned relative to it,
+   *  so view coordinates stay stable when the dataset is swapped per viewport. */
+  setOrigin(ns: number) {
+    this.originNs = ns;
+    this.originSet = true;
+    this.t0ns = ns;
+  }
+
+  /** Whole captured span (ns) — drives fit()/follow even though only a window is
+   *  held in memory. */
+  setSpan(spanNs: number) {
+    this.fullSpanMs = spanNs / 1e6;
+  }
+
+  /** Replace the in-memory data with a freshly-fetched window, dropping whatever
+   *  was held before. Preserves view state (zoom/pan/follow) and the fixed origin
+   *  so the swap is seamless; track identity is rebuilt from the window (colors
+   *  are keyed off gid, so they stay stable across swaps). */
+  replaceWindow(
+    slices: Slice[],
+    gc: { start: number; dur: number; gen: number; collected: number }[],
+  ) {
+    this.count = 0;
+    this.spanMs = 0;
+    this.nTracks = 0;
+    this.trackOf.clear();
+    this.trackName = [];
+    this.hubTrack = [];
+    this.trackRun = [];
+    this.rowsDirty = true;
+    this.placed = 0;
+    this.slowIdx = [];
+    this.funcTab = [""];
+    this.funcMap = new Map([["", 0]]);
+    this.taskTab = [""];
+    this.taskMap = new Map([["", 0]]);
+    this.stackTab = [""];
+    this.stackMap = new Map([["", 0]]);
+    this.cpuBins = new Float32Array(4096);
+    this.nBins = 0;
+    this.gcStart = [];
+    this.gcDur = [];
+    this.gcGen = [];
+    this.gcColl = [];
+    this.addSlices(slices);
+    if (gc.length) this.addGc(gc);
+  }
+
+  /** Center the view on an absolute time (ns), canceling follow. */
+  seekTo(ns: number) {
+    this.follow = false;
+    const cw = this.canvas.clientWidth || 1000;
+    const tMs = (ns - this.originNs) / 1e6;
+    this.viewT0 = Math.max(0, tMs - cw / this.pxPerMs / 2);
   }
 
   setDragMode(m: "pan" | "zoom") {

@@ -6,10 +6,13 @@
 ![viewer](https://img.shields.io/badge/viewer-WebGL2-8A2BE2)
 ![slop](https://img.shields.io/badge/slop-100%25-brightgreen)
 
-A live timeline profiler for **gevent** and **asyncio** applications. greenlane
-attaches to a running Python process and streams a fast, zoomable web timeline of
-_which unit of work ran when_, what it was doing, and where the scheduler stalls
-— no code changes, no restart.
+greenlane is a microscope for **gevent** and **asyncio** applications. It
+attaches to a running Python process and records scheduler activity — every
+greenlet switch or task step, plus GC pauses — then lays it out on a fast,
+zoomable web timeline. By combining the runtime scheduler, the garbage collector,
+and your own call stacks in one view, "what is my app actually doing?" becomes
+something you can see: which unit of work ran when, what it was doing, and where
+the scheduler stalls.
 
 It is a single self-contained binary. The web viewer is baked in, and the only
 thing that ever touches your process is a small bootstrap greenlane injects at
@@ -41,8 +44,6 @@ greenlane --help
 The viewer is embedded in the binary, so that's the whole install. The
 **target** process you attach to must be running **CPython 3.14+** (see
 [Attaching & permissions](#attaching--permissions)).
-
-> Homebrew support is coming.
 
 ### Build from source
 
