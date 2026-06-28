@@ -131,3 +131,13 @@ Useful flags:
 - `--python <bin>` — helper interpreter that drives `sys.remote_exec` (3.14+).
 - `--out <path>` — where to save the recording.
 - `--log-format <text|json>` and `RUST_LOG` — diagnostics (all go to stderr).
+
+## Acknowledgments
+
+Respect and inspiration to the projects that gave the idea — greenlane exists to
+fill a similar gap in the Python ecosystem:
+
+- [tokio-console](https://github.com/tokio-rs/console) — the async runtime
+  debugger for Tokio that showed how good live scheduler introspection can feel.
+- [dial9](https://github.com/dial9-rs/dial9) — for the approach to reaching into
+  a running process and making its internals legible.

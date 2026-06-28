@@ -515,9 +515,9 @@ fn slowlog(
         }
     };
     if sort_dur {
-        rows.sort_by(|a, b| b.dur.cmp(&a.dur));
+        rows.sort_by_key(|r| std::cmp::Reverse(r.dur)); // longest first
     } else {
-        rows.sort_by(|a, b| b.start.cmp(&a.start));
+        rows.sort_by_key(|r| std::cmp::Reverse(r.start)); // newest first
     }
     rows.truncate(limit);
     Ok(Reply::Slowlog(rows))

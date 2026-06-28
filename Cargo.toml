@@ -2,6 +2,24 @@
 name = "greenlane"
 version = "0.1.0"
 edition = "2024"
+description = "A microscope for gevent and asyncio applications: a live timeline profiler that attaches to a running Python process and visualizes scheduler activity, GC pauses, and call stacks."
+authors = ["Serhii Babak"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mermoldy/greenlane"
+homepage = "https://github.com/mermoldy/greenlane"
+readme = "README.md"
+keywords = ["gevent", "asyncio", "profiler", "greenlet", "tracing"]
+categories = ["development-tools::profiling", "development-tools::debugging"]
+# web/dist/* is git-ignored (built by `bun run build`), so it is excluded from
+# the package by default. rust-embed needs those assets at compile time, so list
+# them explicitly here — build the viewer (`make web`) before `cargo publish`.
+include = [
+    "src/**/*",
+    "web/dist/**/*",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+]
 
 [dependencies]
 anyhow = "1"

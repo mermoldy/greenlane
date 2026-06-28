@@ -10,23 +10,47 @@ import {
 import "./styles.css";
 
 type Source = { file: string; bytes: number };
+type GcEvent = { start: number; dur: number; gen: number; collected: number };
+type SlowRow = {
+  start: number;
+  dur: number;
+  gid: number;
+  name: string;
+  func: string;
+  level: number;
+};
 
 type WsMsg =
-  | { type: "snapshot"; slices: Slice[]; bytes: number }
-  | { type: "slices"; slices: Slice[]; bytes: number }
+  // Session metadata (once on connect): identity, the fixed time origin, and the
+  // whole-capture span/counts so the viewer can fit/follow without holding data.
   | {
       type: "meta";
       pid: number;
       epochMs: number | null;
       live: boolean;
       source: Source | null;
+      originNs: number;
+      spanNs: number;
+      totalSlices: number;
       bytes: number;
     }
-  | { type: "status"; live: boolean }
+  // Reply to a viewport request: only the slices/GC overlapping the visible range.
   | {
-      type: "gc";
-      events: { start: number; dur: number; gen: number; collected: number }[];
-    };
+      type: "window";
+      t0: number;
+      t1: number;
+      slices: Slice[];
+      gc: GcEvent[];
+      counts: { visible: number; total: number };
+      capped: boolean;
+      spanNs: number;
+      bytes: number;
+    }
+  // Live edge advance (so follow keeps moving and the header stays current).
+  | { type: "head"; spanNs: number; totalSlices: number; bytes: number }
+  | { type: "slowlog"; rows: SlowRow[] }
+  | { type: "stats"; p50: number; p95: number; p99: number }
+  | { type: "status"; live: boolean };
 
 // Bytes → a compact human size, e.g. 1.4 MB.
 function formatBytes(n: number): string {
@@ -83,24 +107,25 @@ function App() {
   const [tmode, setTmode] = useState<"relative" | "current" | "utc">(
     "relative",
   );
-  const [count, setCount] = useState(0);
+  const [total, setTotal] = useState(0); // whole-capture slice count (server)
   const [tracks, setTracks] = useState(0);
   const [gc, setGc] = useState(0);
   const [rate, setRate] = useState(0);
+  const [p95, setP95] = useState(0); // non-Hub duration p95 (ns), from the DB
+  const [capped, setCapped] = useState(false); // window hit the slice cap
   const [source, setSource] = useState<Source | null>(null);
-  // Raw event-stream bytes the server has processed (live mode's analogue to a
-  // recording's file size). The server is authoritative and sends the running
-  // total on each frame; we hold it in a ref and surface it through the
-  // existing poll so it doesn't re-render per message.
+  // Server-authoritative running totals, held in refs and surfaced via the poll
+  // so they don't re-render per message.
   const [dataBytes, setDataBytes] = useState(0);
   const dataBytesRef = useRef(0);
+  const totalRef = useRef(0);
+  const wsRef = useRef<WebSocket | null>(null);
   const [drag, setDrag] = useState<"pan" | "zoom">("zoom");
   const [helpOpen, setHelpOpen] = useState(false);
   const [slowOpen, setSlowOpen] = useState(false);
-  const [slowCount, setSlowCount] = useState(0);
-  const [slowList, setSlowList] = useState<ReturnType<Timeline["slowSpans"]>>(
-    [],
-  );
+  const [slowLevel, setSlowLevel] = useState<"all" | "warn" | "red">("all");
+  const [slowSort, setSlowSort] = useState<"time" | "dur">("time");
+  const [slowRows, setSlowRows] = useState<SlowRow[]>([]);
   const [follow, setFollow] = useState(true);
   const [zoom, setZoom] = useState(1); // pxPerMs
   const [sort, setSort] = useState<SortMode>("recent1");
@@ -124,33 +149,48 @@ function App() {
     tlRef.current = tl;
     tl.onHover = setHover;
     tl.onSelect = setSelected;
+    // The visible range changed → ask the server for exactly that window.
+    tl.onViewport = (t0, t1, px) => {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "viewport", t0, t1, px }));
+      }
+    };
     setHeaderH(tl.headerHeight());
     setRowH(tl.rowHeight());
     const poll = setInterval(() => {
-      setCount(tl.count);
+      setTotal(totalRef.current);
       setTracks(tl.nTracks);
       setFollow(tl.follow);
       setZoom(tl.pxPerMs);
       setSort(tl.sortMode);
       setGc(tl.gcCount());
-      setRate(tl.eventsPerSec());
+      // Rate over the WHOLE capture (window count would understate it).
+      setRate(tl.fullSpanMs > 0 ? totalRef.current / (tl.fullSpanMs / 1000) : 0);
       setDataBytes(dataBytesRef.current);
-      setSlowCount(tl.slowCount());
       setLabels(tl.trackLabels());
     }, 150);
     return () => clearInterval(poll);
   }, []);
 
-  // Refresh the slow-log list only while the panel is open.
+  // Slow log + p95 are server-side DB queries. While the panel is open, (re)issue
+  // the slow-log query on level/sort change and on a timer; p95 refreshes always.
   useEffect(() => {
-    if (!slowOpen) return;
-    const tl = tlRef.current;
-    if (!tl) return;
-    const upd = () => setSlowList(tl.slowSpans(500));
-    upd();
-    const id = setInterval(upd, 500);
+    const send = (m: object) => {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(m));
+    };
+    const stats = () => send({ type: "stats" });
+    const slow = () =>
+      send({ type: "slowlog", level: slowLevel, sort: slowSort, limit: 500 });
+    stats();
+    if (slowOpen) slow();
+    const id = setInterval(() => {
+      stats();
+      if (slowOpen) slow();
+    }, 1000);
     return () => clearInterval(id);
-  }, [slowOpen]);
+  }, [slowOpen, slowLevel, slowSort]);
 
   useEffect(() => {
     let ws: WebSocket;
@@ -158,6 +198,7 @@ function App() {
     const connect = () => {
       const proto = location.protocol === "https:" ? "wss" : "ws";
       ws = new WebSocket(`${proto}://${location.host}/ws`);
+      wsRef.current = ws;
       ws.onopen = () => setConnected(true);
       ws.onclose = () => {
         setConnected(false);
@@ -165,24 +206,50 @@ function App() {
       };
       ws.onmessage = (e) => {
         const msg: WsMsg = JSON.parse(e.data);
-        if (msg.type === "meta") {
-          setPid(msg.pid);
-          setLive(msg.live);
-          setSource(msg.source);
-          dataBytesRef.current = msg.bytes;
-          if (tlRef.current) tlRef.current.epochMs = msg.epochMs ?? NaN;
-          if (!msg.live) freeze();
-        } else if (msg.type === "status") {
-          setLive(msg.live);
-          if (!msg.live) freeze();
-        } else if (msg.type === "gc") {
-          tlRef.current?.addGc(msg.events);
-        } else {
-          // A snapshot rebuilds the timeline from scratch (e.g. on reconnect).
-          if (msg.type === "snapshot") tlRef.current?.reset();
-          // The server sends the authoritative running byte total each frame.
-          dataBytesRef.current = msg.bytes;
-          tlRef.current?.addSlices(msg.slices);
+        const tl = tlRef.current;
+        switch (msg.type) {
+          case "meta":
+            setPid(msg.pid);
+            setLive(msg.live);
+            setSource(msg.source);
+            dataBytesRef.current = msg.bytes;
+            totalRef.current = msg.totalSlices;
+            if (tl) {
+              tl.epochMs = msg.epochMs ?? NaN;
+              tl.setOrigin(msg.originNs);
+              tl.setSpan(msg.spanNs);
+              // A recording is static: stop following and fit the whole span so
+              // the first window covers it. Live keeps following the edge.
+              if (!msg.live) {
+                tl.follow = false;
+                setFollow(false);
+                tl.fit();
+              }
+            }
+            break;
+          case "window":
+            // Drop the previous window and render only this one (bounded memory).
+            dataBytesRef.current = msg.bytes;
+            totalRef.current = msg.counts.total;
+            setCapped(msg.capped);
+            tl?.setSpan(msg.spanNs);
+            tl?.replaceWindow(msg.slices, msg.gc);
+            break;
+          case "head":
+            dataBytesRef.current = msg.bytes;
+            totalRef.current = msg.totalSlices;
+            tl?.setSpan(msg.spanNs);
+            break;
+          case "slowlog":
+            setSlowRows(msg.rows);
+            break;
+          case "stats":
+            setP95(msg.p95);
+            break;
+          case "status":
+            setLive(msg.live);
+            if (!msg.live) freeze();
+            break;
         }
       };
     };
@@ -258,9 +325,9 @@ function App() {
         )}
         <span
           className="stat"
-          title="Closed run intervals collected so far. Each slice is one continuous task or greenlet run."
+          title="Closed run intervals collected so far (whole capture). Each slice is one continuous task or greenlet run."
         >
-          {count.toLocaleString()} slices
+          {total.toLocaleString()} slices
         </span>
         {!source && (
           <span
@@ -288,6 +355,23 @@ function App() {
         >
           {gc.toLocaleString()} GC
         </span>
+        {p95 > 0 && (
+          <span
+            className="stat"
+            title="95th-percentile run-interval duration (non-Hub), computed in the database over the whole capture."
+          >
+            p95 {formatTime(p95 / 1e6)}
+          </span>
+        )}
+        {capped && (
+          <span
+            className="stat"
+            title="The visible range has more slices than the render cap; zoom in to see them all."
+            style={{ color: "#ebcb8b" }}
+          >
+            ⚠ capped
+          </span>
+        )}
         <label className="ctl" title={sortTitle(sort)}>
           sort
           <select
@@ -410,8 +494,12 @@ function App() {
       </div>
       {slowOpen && (
         <SlowLog
-          spans={slowList}
-          onPick={(idx) => tlRef.current?.revealSpan(idx)}
+          rows={slowRows}
+          level={slowLevel}
+          sort={slowSort}
+          onLevel={setSlowLevel}
+          onSort={setSlowSort}
+          onPick={(startNs, durNs) => tlRef.current?.revealSpanAt(startNs, durNs)}
           onClose={() => setSlowOpen(false)}
         />
       )}
@@ -419,9 +507,9 @@ function App() {
         <button
           className={`slowtoggle${slowOpen ? " on" : ""}`}
           onClick={() => setSlowOpen((v) => !v)}
-          title="slow spans (>20ms)"
+          title="slow spans (>20ms), queried from the database"
         >
-          slow log ({slowCount.toLocaleString()}) {slowOpen ? "▾" : "▸"}
+          slow log ({slowRows.length.toLocaleString()}) {slowOpen ? "▾" : "▸"}
         </button>
         <div className="bbright">
           <span className="seg" title="what dragging the timeline does">
@@ -505,47 +593,41 @@ function App() {
   );
 }
 
-// Bottom slow-log panel: warn/slow spans, newest first; click to jump.
+// Bottom slow-log panel. Rows are queried from the database (the level/sort
+// controls re-issue the query upstream); click a row to seek the timeline to it.
 function SlowLog({
-  spans,
+  rows,
+  level,
+  sort,
+  onLevel,
+  onSort,
   onPick,
   onClose,
 }: {
-  spans: ReturnType<Timeline["slowSpans"]>;
-  onPick: (idx: number) => void;
+  rows: SlowRow[];
+  level: "all" | "warn" | "red";
+  sort: "time" | "dur";
+  onLevel: (l: "all" | "warn" | "red") => void;
+  onSort: (s: "time" | "dur") => void;
+  onPick: (startNs: number, durNs: number) => void;
   onClose: () => void;
 }) {
-  const [by, setBy] = useState<"time" | "dur">("time");
-  const [lvl, setLvl] = useState<"all" | "warn" | "red">("all");
-  // spans arrive newest-first (by time); filter by level, then sort a copy.
-  let rows =
-    lvl === "all"
-      ? spans
-      : spans.filter((s) => (lvl === "red" ? s.level >= 2 : s.level === 1));
-  if (by === "dur") rows = [...rows].sort((a, b) => b.durNs - a.durNs);
+  // "warn" = warn-level only (the DB returns warn+red for "all"/"warn").
+  const shown = level === "warn" ? rows.filter((r) => r.level === 1) : rows;
   return (
     <div className="slowlog">
       <div className="slowlog-head">
-        <span>slow log · {rows.length} shown</span>
+        <span>slow log · {shown.length} shown</span>
         <span className="segwrap">
           show
           <span className="seg">
-            <button
-              className={lvl === "all" ? "sel" : ""}
-              onClick={() => setLvl("all")}
-            >
+            <button className={level === "all" ? "sel" : ""} onClick={() => onLevel("all")}>
               all
             </button>
-            <button
-              className={lvl === "warn" ? "sel" : ""}
-              onClick={() => setLvl("warn")}
-            >
+            <button className={level === "warn" ? "sel" : ""} onClick={() => onLevel("warn")}>
               warn
             </button>
-            <button
-              className={lvl === "red" ? "sel" : ""}
-              onClick={() => setLvl("red")}
-            >
+            <button className={level === "red" ? "sel" : ""} onClick={() => onLevel("red")}>
               red
             </button>
           </span>
@@ -553,16 +635,10 @@ function SlowLog({
         <span className="segwrap">
           sort
           <span className="seg">
-            <button
-              className={by === "time" ? "sel" : ""}
-              onClick={() => setBy("time")}
-            >
+            <button className={sort === "time" ? "sel" : ""} onClick={() => onSort("time")}>
               time
             </button>
-            <button
-              className={by === "dur" ? "sel" : ""}
-              onClick={() => setBy("dur")}
-            >
+            <button className={sort === "dur" ? "sel" : ""} onClick={() => onSort("dur")}>
               duration
             </button>
           </span>
@@ -573,21 +649,21 @@ function SlowLog({
         </button>
       </div>
       <div className="slowlog-body">
-        {rows.length === 0 && (
+        {shown.length === 0 && (
           <div className="slowrow muted">no spans over 20 ms yet</div>
         )}
-        {rows.map((s) => (
-          <div key={s.idx} className="slowrow" onClick={() => onPick(s.idx)}>
+        {shown.map((s, i) => (
+          <div key={i} className="slowrow" onClick={() => onPick(s.start, s.dur)}>
             <span
               className="lvl"
               style={{ background: s.level >= 2 ? "#e8606b" : "#ebcb8b" }}
             />
-            <span className="sdur" style={{ color: durColor(s.durNs / 1e6) }}>
-              {formatTime(s.durNs / 1e6)}
+            <span className="sdur" style={{ color: durColor(s.dur / 1e6) }}>
+              {formatTime(s.dur / 1e6)}
             </span>
             <span className="snm">{s.name}</span>
             <span className="sfn">{s.func || "—"}</span>
-            <span className="sat">+{formatTime(s.startNs / 1e6)}</span>
+            <span className="sat">+{formatTime(s.start / 1e6)}</span>
           </div>
         ))}
       </div>

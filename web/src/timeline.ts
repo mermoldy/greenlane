@@ -301,6 +301,9 @@ export class Timeline {
   private lastVpMs = 0;
   private firedViewT0 = NaN;
   private firedPxPerMs = NaN;
+  // A span highlighted from the slow-log (ms relative to origin + click time, for
+  // the flash). Drawn as a bright time band so the clicked span is easy to find.
+  private hl: { t0Ms: number; t1Ms: number; at: number } | null = null;
 
   private mouseX = -1;
   private mouseY = -1;
@@ -731,13 +734,16 @@ export class Timeline {
   }
 
   fit() {
-    const span = this.maxT();
+    // Fit the WHOLE captured span (server-reported), not just the in-memory
+    // window — the window then loads to match.
+    const span = this.fullSpanMs > 0 ? this.fullSpanMs : this.maxT();
     if (span <= 0) return;
     const w = this.canvas.clientWidth || 1000;
     this.pxPerMs = Math.min(
       MAX_PXPERMS,
       Math.max(MIN_PXPERMS, (w * 0.96) / span),
     );
+    this.fitted = true; // an explicit fit suppresses the initial auto-zoom
     // Keep follow as-is (fit must not cancel it); only reposition when paused.
     if (!this.follow) this.viewT0 = 0;
   }
@@ -809,6 +815,22 @@ export class Timeline {
     this.viewT0 = Math.max(0, tMs - cw / this.pxPerMs / 2);
   }
 
+  /** Jump to and zoom in on a span (absolute ns), framing it at ~40% of the
+   *  viewport and marking it with a highlight band. Used by the slow-log click;
+   *  the new window then streams in around it. */
+  revealSpanAt(startNs: number, durNs: number) {
+    const cw = this.canvas.clientWidth || 1000;
+    const durMs = Math.max(durNs / 1e6, 1e-3);
+    const sMs = (startNs - this.originNs) / 1e6;
+    this.follow = false;
+    this.pxPerMs = Math.min(
+      MAX_PXPERMS,
+      Math.max(MIN_PXPERMS, (cw * 0.4) / durMs),
+    );
+    this.viewT0 = Math.max(0, sMs + durMs / 2 - cw / this.pxPerMs / 2);
+    this.hl = { t0Ms: sMs, t1Ms: sMs + durMs, at: performance.now() };
+  }
+
   setDragMode(m: "pan" | "zoom") {
     this.dragMode = m;
   }
@@ -866,7 +888,9 @@ export class Timeline {
 
     const nowWall = performance.now();
     if (this.follow) {
-      const m = this.maxT();
+      // Follow the whole capture's live edge (server-reported), not the last
+      // slice in the in-memory window.
+      const m = this.fullSpanMs > 0 ? this.fullSpanMs : this.maxT();
       if (!this.wasFollowing) {
         this.anchorData = m;
         this.anchorLocal = nowWall;
@@ -888,6 +912,22 @@ export class Timeline {
       this.viewT0 = Math.max(0, edge - visMs * 0.9);
     }
     this.wasFollowing = this.follow;
+
+    // Tell the app which absolute time range is visible so it can fetch that
+    // window from the server (throttled to ~10/s; fires while following too).
+    if (this.onViewport) {
+      const changed =
+        this.viewT0 !== this.firedViewT0 || this.pxPerMs !== this.firedPxPerMs;
+      if (changed && nowWall - this.lastVpMs >= 100) {
+        this.lastVpMs = nowWall;
+        this.firedViewT0 = this.viewT0;
+        this.firedPxPerMs = this.pxPerMs;
+        const visMs = cw / this.pxPerMs;
+        const t0ns = Math.max(0, Math.floor(this.originNs + this.viewT0 * 1e6));
+        const t1ns = Math.ceil(this.originNs + (this.viewT0 + visMs) * 1e6);
+        this.onViewport(t0ns, t1ns, Math.max(1, Math.ceil(cw)));
+      }
+    }
 
     // In any activity-based mode, re-rank periodically (throttled) — but only
     // while following; when paused, rows stay put so you can inspect.
@@ -1134,6 +1174,37 @@ export class Timeline {
         if (x0 + w < 0 || x0 > cw) continue;
         ctx.fillStyle = "rgba(170,130,210,0.3)";
         ctx.fillRect(x0, RULER_H, w, ch - RULER_H);
+      }
+    }
+
+    // Highlighted span (slow-log click): a bright full-height time band that
+    // flashes briefly, then settles to a persistent outline + caret so the
+    // clicked span stays easy to spot after the window streams in around it.
+    if (this.hl) {
+      const x0 = (this.hl.t0Ms - this.viewT0) * this.pxPerMs;
+      const bw = Math.max((this.hl.t1Ms - this.hl.t0Ms) * this.pxPerMs, 3);
+      if (x0 + bw >= 0 && x0 <= cw) {
+        const flash = Math.max(0, 1 - (performance.now() - this.hl.at) / 900);
+        ctx.fillStyle = `rgba(136,192,208,${0.1 + 0.35 * flash})`;
+        ctx.fillRect(x0, RULER_H, bw, ch - RULER_H);
+        ctx.strokeStyle = "rgba(143,220,235,0.9)";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(x0 + 0.5, RULER_H);
+        ctx.lineTo(x0 + 0.5, ch);
+        ctx.moveTo(x0 + bw - 0.5, RULER_H);
+        ctx.lineTo(x0 + bw - 0.5, ch);
+        ctx.stroke();
+        ctx.lineWidth = 1;
+        // Caret marker centered at the top of the band.
+        const cx = x0 + bw / 2;
+        ctx.fillStyle = "rgba(143,220,235,0.95)";
+        ctx.beginPath();
+        ctx.moveTo(cx - 5, RULER_H + 1);
+        ctx.lineTo(cx + 5, RULER_H + 1);
+        ctx.lineTo(cx, RULER_H + 8);
+        ctx.closePath();
+        ctx.fill();
       }
     }
 
