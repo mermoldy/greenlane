@@ -20,17 +20,28 @@ from gevent import monkey
 
 monkey.patch_all()
 
+import logging
 import os
 import sys
 import time
 
 import gevent
 import greenlet
+import structlog
 from gevent.pool import Pool
 
+logging.basicConfig(format="%(message)s", stream=sys.stdout, level=logging.INFO)
+structlog.configure(
+    processors=[
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="%H:%M:%S"),
+        structlog.dev.ConsoleRenderer(),
+    ],
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    wrapper_class=structlog.stdlib.BoundLogger,
+)
 
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+log = structlog.get_logger()
 
 
 # ── Self-measurement ────────────────────────────────────────────────────────
@@ -60,12 +71,12 @@ def burst(_i, rounds=4):
 def report(n, mode):
     """Background greenlet: print switches/sec once a second."""
     last_n, last_t = _switches[0], time.perf_counter()
-    log(f"stress: {n} greenlets ({mode}) -- PID={os.getpid()} -- attach greenlane now")
+    log.info("stress started", greenlets=n, mode=mode, pid=os.getpid())
     while True:
         gevent.sleep(1.0)
         now_n, now_t = _switches[0], time.perf_counter()
         rate = (now_n - last_n) / (now_t - last_t)
-        log(f"~{rate:,.0f} switches/sec  (total {now_n:,})")
+        log.info("switches", per_sec=round(rate), total=now_n)
         last_n, last_t = now_n, now_t
 
 
@@ -99,7 +110,7 @@ def main():
         else:
             run_spin(n)
     except KeyboardInterrupt:
-        log(f"stopping. peak total = {_switches[0]:,} switches. Bye!")
+        log.info("stopping", total=_switches[0])
 
 
 if __name__ == "__main__":

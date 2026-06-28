@@ -47,6 +47,32 @@ function formatRate(r: number): string {
   return `${r.toFixed(r < 10 ? 1 : 0)}/s`;
 }
 
+function sortTitle(sort: SortMode): string {
+  switch (sort) {
+    case "recent1":
+      return "Order lanes by scheduler activity in the most recent 1 second.";
+    case "recent10":
+      return "Order lanes by scheduler activity in the most recent 10 seconds.";
+    case "recent60":
+      return "Order lanes by scheduler activity in the most recent 60 seconds.";
+    case "activity":
+      return "Order lanes by total run time across the whole capture.";
+    case "ident":
+      return "Order lanes by their stable runtime identity.";
+  }
+}
+
+function timeModeTitle(mode: "relative" | "current" | "utc"): string {
+  switch (mode) {
+    case "relative":
+      return "Show elapsed time from the beginning of the trace.";
+    case "current":
+      return "Show local wall-clock time using the trace start timestamp.";
+    case "utc":
+      return "Show UTC wall-clock time using the trace start timestamp.";
+  }
+}
+
 function App() {
   const glRef = useRef<HTMLCanvasElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
@@ -183,10 +209,24 @@ function App() {
   return (
     <div className="app">
       <div className="topbar">
-        <span className="title">
+        <span
+          className="title"
+          title="greenlane: live timeline profiler for gevent and asyncio scheduler activity"
+        >
           <IconLane /> greenlane
         </span>
-        <span className="stat">
+        <span
+          className="stat"
+          title={
+            !connected
+              ? "The viewer is not connected to the greenlane WebSocket."
+              : source
+                ? "Viewing a saved .glr recording. The timeline is static."
+                : live
+                  ? "Connected to a live target process and still receiving events."
+                  : "Detached from the target. The trace is no longer collecting new events."
+          }
+        >
           <span
             className={`dot ${connected ? (source ? "file" : live ? "live" : "dead") : "dead"}`}
           />
@@ -199,60 +239,121 @@ function App() {
                 : "detached"}
         </span>
         {source && (
-          <span className="stat file" title={source.file}>
+          <span
+            className="stat file"
+            title={`Recording file: ${source.file}. Size: ${formatBytes(source.bytes)}.`}
+          >
             <IconOpen />
             <span className="nm">{source.file.split("/").pop()}</span>
             <span>· {formatBytes(source.bytes)}</span>
           </span>
         )}
-        {pid != null && <span className="stat">pid {pid}</span>}
-        <span className="stat">{count.toLocaleString()} slices</span>
+        {pid != null && (
+          <span
+            className="stat"
+            title="Process ID of the target Python process this session attached to."
+          >
+            pid {pid}
+          </span>
+        )}
+        <span
+          className="stat"
+          title="Closed run intervals collected so far. Each slice is one continuous task or greenlet run."
+        >
+          {count.toLocaleString()} slices
+        </span>
         {!source && (
           <span
             className="stat"
-            title="timeline data streamed and processed so far"
+            title="Raw event-stream bytes received and processed by the server so far."
           >
             {formatBytes(dataBytes)}
           </span>
         )}
         <span
           className="stat"
-          title="mean greenlet switches per second over the captured span"
+          title="Mean scheduler events per second over the captured time span."
         >
           {formatRate(rate)}
         </span>
-        <span className="stat">{tracks} greenlets</span>
-        <span className="stat gc">{gc.toLocaleString()} GC</span>
-        <label className="ctl">
+        <span
+          className="stat"
+          title="Number of lanes discovered in the trace. A lane is a gevent greenlet or asyncio task."
+        >
+          {tracks} lanes
+        </span>
+        <span
+          className="stat gc"
+          title="Garbage-collection pauses captured as global timeline markers."
+        >
+          {gc.toLocaleString()} GC
+        </span>
+        <label className="ctl" title={sortTitle(sort)}>
           sort
           <select
             value={sort}
+            title={sortTitle(sort)}
             onChange={(e) => {
               const m = e.target.value as SortMode;
               tlRef.current?.setSortMode(m);
               setSort(m);
             }}
           >
-            <option value="recent1">activity (1s)</option>
-            <option value="recent10">activity (10s)</option>
-            <option value="recent60">activity (60s)</option>
-            <option value="activity">activity (total)</option>
-            <option value="ident">ident</option>
+            <option
+              value="recent1"
+              title="Put lanes with the most run time in the latest 1 second first."
+            >
+              activity (1s)
+            </option>
+            <option
+              value="recent10"
+              title="Put lanes with the most run time in the latest 10 seconds first."
+            >
+              activity (10s)
+            </option>
+            <option
+              value="recent60"
+              title="Put lanes with the most run time in the latest 60 seconds first."
+            >
+              activity (60s)
+            </option>
+            <option
+              value="activity"
+              title="Put lanes with the highest total run time first."
+            >
+              activity (total)
+            </option>
+            <option value="ident" title="Use stable runtime identity order.">
+              ident
+            </option>
           </select>
         </label>
-        <label className="ctl">
+        <label className="ctl" title={timeModeTitle(tmode)}>
           time
           <select
             value={tmode}
+            title={timeModeTitle(tmode)}
             onChange={(e) => {
               const m = e.target.value as "relative" | "current" | "utc";
               tlRef.current?.setTimeMode(m);
               setTmode(m);
             }}
           >
-            <option value="relative">relative</option>
-            <option value="current">current</option>
-            <option value="utc">utc</option>
+            <option
+              value="relative"
+              title="Show time as elapsed duration since trace start."
+            >
+              relative
+            </option>
+            <option
+              value="current"
+              title="Show local clock time for each point on the trace."
+            >
+              current
+            </option>
+            <option value="utc" title="Show UTC clock time for the trace.">
+              utc
+            </option>
           </select>
         </label>
         <div className="right">
@@ -260,14 +361,18 @@ function App() {
             className="danger"
             onClick={() => fetch("/detach", { method: "POST" }).catch(() => {})}
             disabled={!connected || !live}
-            title="stop instrumenting the target"
+            title="Stop instrumenting the target process and leave the current timeline frozen."
           >
             <IconDetach /> detach
           </button>
           <button
             className={follow ? "followon" : "followoff"}
             onClick={toggleFollow}
-            title="follow live edge"
+            title={
+              follow
+                ? "Following the live edge. Click to keep the current viewport in place."
+                : "Follow is paused. Click to jump back to the live edge as new data arrives."
+            }
           >
             <IconFollow /> {follow ? "following" : "follow off"}
           </button>

@@ -33,10 +33,17 @@ use axum::routing::{get, post};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
-use crate::store::Store;
+use crate::db::{Db, Query, Reply};
 
-/// How often each viewer is sent the tail of new slices.
-const TICK: Duration = Duration::from_millis(33);
+/// How often a live session pushes a `head` (so the viewer follows + updates the
+/// header). Recordings are static and get none.
+const HEAD_TICK: Duration = Duration::from_millis(100);
+
+/// Hard cap on slices returned per viewport window (memory bound).
+const WINDOW_CAP: usize = 200_000;
+/// Slow-span thresholds (ns): warn > 20ms, red > 50ms (mirrors the renderer).
+const WARN_NS: u64 = 20_000_000;
+const RED_NS: u64 = 50_000_000;
 
 /// Provenance of an opened recording, surfaced to the viewer for context.
 #[derive(Clone)]
@@ -50,7 +57,7 @@ pub struct Source {
 /// Shared server state.
 #[derive(Clone)]
 struct AppState {
-    store: Arc<Store>,
+    db: Db,
     /// Target PID we attached to.
     pid: i32,
     /// Set by /detach: stops collection so the target self-uninstalls its hook.
@@ -66,7 +73,7 @@ struct Assets;
 
 /// Run the viewer server until `shutdown` resolves.
 pub async fn serve(
-    store: Arc<Store>,
+    db: Db,
     pid: i32,
     detached: Arc<AtomicBool>,
     source: Option<Source>,
@@ -75,7 +82,7 @@ pub async fn serve(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     let state = AppState {
-        store,
+        db,
         pid,
         detached,
         source,
@@ -155,65 +162,57 @@ async fn ws_handler(ws: WebSocketUpgrade, State(st): State<AppState>) -> Respons
 }
 
 async fn client(mut socket: WebSocket, st: AppState) {
-    // Session metadata: PID, wall-clock epoch of trace t0 (for absolute time
-    // modes; null if unknown), and current live/detached status.
+    // Session metadata: PID, epoch, live/detached, recording source, the fixed
+    // global time origin, the full captured span + counts (so the viewer can
+    // fit/follow and render the header without holding any timeline data).
     let meta = serde_json::json!({
         "type": "meta",
         "pid": st.pid,
-        "epochMs": st.store.epoch(),
+        "epochMs": st.db.epoch(),
         "live": !st.detached.load(Ordering::SeqCst),
-        // Provenance for opened recordings (file name + on-disk size); null when
-        // this is a live attach, so the viewer can distinguish the two.
         "source": st.source.as_ref().map(|s| serde_json::json!({
             "file": s.file,
             "bytes": s.bytes,
         })),
-        // Raw event-stream bytes processed so far (live data volume).
-        "bytes": st.store.bytes(),
+        "originNs": st.db.origin(),
+        "spanNs": st.db.span(),
+        "totalSlices": st.db.total(),
+        "bytes": st.db.bytes(),
     });
-    if socket
-        .send(Message::Text(meta.to_string().into()))
-        .await
-        .is_err()
-    {
+    if send_json(&mut socket, &meta).await.is_err() {
         return;
     }
 
-    let mut cursor = 0usize;
-    let mut gc_cursor = 0usize;
-    let mut first = true;
     let mut was_detached = st.detached.load(Ordering::SeqCst);
-    let mut tick = tokio::time::interval(TICK);
+    let mut tick = tokio::time::interval(HEAD_TICK);
 
     loop {
         tokio::select! {
-            // Detect close / process control frames by polling the socket.
             inbound = socket.recv() => {
-                if inbound.is_none() { break; } // closed
+                match inbound {
+                    // The viewer drives data flow with viewport/slowlog/stats requests.
+                    Some(Ok(Message::Text(t))) => {
+                        if let Some(reply) = handle_request(&st, &t).await
+                            && send_json(&mut socket, &reply).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Some(Ok(_)) => {} // ping/pong/binary — ignore
+                    _ => break,        // closed or error
+                }
             }
             _ = tick.tick() => {
-                let (batch, len) = st.store.delta(cursor);
-                cursor = len;
-                // The first frame always goes out (even if empty) so the client
-                // resets; later frames only when there's new data.
-                if !batch.is_empty() || first {
-                    let kind = if first { "snapshot" } else { "slices" };
-                    first = false;
-                    // Piggyback the running byte total so the header's live data
-                    // volume updates in step with the timeline.
-                    let msg = serde_json::json!({
-                        "type": kind, "slices": batch, "bytes": st.store.bytes(),
+                // Live sessions push a head so the viewer follows the edge and the
+                // header (span/total/bytes) stays current; recordings are static.
+                if !st.detached.load(Ordering::SeqCst) {
+                    let head = serde_json::json!({
+                        "type": "head",
+                        "spanNs": st.db.span(),
+                        "totalSlices": st.db.total(),
+                        "bytes": st.db.bytes(),
                     });
-                    if socket.send(Message::Text(msg.to_string().into())).await.is_err() {
-                        break;
-                    }
-                }
-                // GC pauses (global stalls), streamed the same way.
-                let (gc, gc_len) = st.store.gc_delta(gc_cursor);
-                gc_cursor = gc_len;
-                if !gc.is_empty() {
-                    let msg = serde_json::json!({ "type": "gc", "events": gc });
-                    if socket.send(Message::Text(msg.to_string().into())).await.is_err() {
+                    if send_json(&mut socket, &head).await.is_err() {
                         break;
                     }
                 }
@@ -222,11 +221,87 @@ async fn client(mut socket: WebSocket, st: AppState) {
                 if d != was_detached {
                     was_detached = d;
                     let s = serde_json::json!({ "type": "status", "live": !d });
-                    if socket.send(Message::Text(s.to_string().into())).await.is_err() {
+                    if send_json(&mut socket, &s).await.is_err() {
                         break;
                     }
                 }
             }
         }
+    }
+}
+
+async fn send_json(socket: &mut WebSocket, v: &serde_json::Value) -> Result<(), ()> {
+    socket
+        .send(Message::Text(v.to_string().into()))
+        .await
+        .map_err(|_| ())
+}
+
+/// Parse a client request and run the matching DB query, returning the JSON reply.
+async fn handle_request(st: &AppState, text: &str) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    match v.get("type")?.as_str()? {
+        "viewport" => {
+            let t0 = v.get("t0")?.as_u64()?;
+            let t1 = v.get("t1")?.as_u64()?;
+            let buckets = v.get("px").and_then(|x| x.as_u64()).unwrap_or(1000) as usize;
+            let q = Query::Window {
+                t0,
+                t1,
+                cap: WINDOW_CAP,
+                buckets: buckets.clamp(1, 4096),
+            };
+            match st.db.query(q).await {
+                Ok(Reply::Window {
+                    slices,
+                    cpu,
+                    tracks,
+                    gc,
+                    visible,
+                    capped,
+                }) => Some(serde_json::json!({
+                    "type": "window", "t0": t0, "t1": t1,
+                    "slices": slices, "cpu": cpu, "tracks": tracks, "gc": gc,
+                    "counts": { "visible": visible, "total": st.db.total() },
+                    "capped": capped, "spanNs": st.db.span(), "bytes": st.db.bytes(),
+                })),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "window query failed");
+                    None
+                }
+            }
+        }
+        "slowlog" => {
+            let level = v.get("level").and_then(|x| x.as_str()).unwrap_or("all");
+            let sort_dur = v.get("sort").and_then(|x| x.as_str()) == Some("dur");
+            let limit = v.get("limit").and_then(|x| x.as_u64()).unwrap_or(500) as usize;
+            let q = Query::Slowlog {
+                warn_ns: WARN_NS,
+                red_ns: RED_NS,
+                red_only: level == "red",
+                sort_dur,
+                limit,
+            };
+            match st.db.query(q).await {
+                Ok(Reply::Slowlog(rows)) => {
+                    Some(serde_json::json!({ "type": "slowlog", "rows": rows }))
+                }
+                _ => None,
+            }
+        }
+        "stats" => {
+            let t0 = v.get("t0").and_then(|x| x.as_u64()).unwrap_or(0);
+            // i64::MAX, not u64::MAX — the DB casts times to i64, where u64::MAX
+            // wraps to -1 and would exclude every row.
+            let t1 = v.get("t1").and_then(|x| x.as_u64()).unwrap_or(i64::MAX as u64);
+            match st.db.query(Query::Stats { t0, t1 }).await {
+                Ok(Reply::Stats { p50, p95, p99 }) => Some(serde_json::json!({
+                    "type": "stats", "p50": p50, "p95": p95, "p99": p99,
+                })),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }

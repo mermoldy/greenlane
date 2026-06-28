@@ -17,3 +17,4 @@ postcard = { version = "1", features = ["alloc"] }
 rust-embed = "8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+polars = { version = "0.54.4", default-features = false, features = ["lazy"] }

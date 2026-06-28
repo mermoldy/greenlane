@@ -6,31 +6,35 @@ Run with:  python tests/asyncio_app.py
 """
 
 import asyncio
+import logging
 import os
 import random
+import sys
 import time
 
+import structlog
 
-def log(msg):
-    """Timestamped log line including the current task's name."""
-    try:
-        task = asyncio.current_task()
-        name = task.get_name() if task is not None else "?"
-    except RuntimeError:
-        name = "?"
-    print(f"[{time.strftime('%H:%M:%S')}] [{name}] {msg}", flush=True)
+logging.basicConfig(format="%(message)s", stream=sys.stdout, level=logging.INFO)
+structlog.configure(
+    processors=[
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="%H:%M:%S"),
+        structlog.dev.ConsoleRenderer(),
+    ],
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    wrapper_class=structlog.stdlib.BoundLogger,
+)
+
+log = structlog.get_logger()
 
 
 async def io_bound(worker_id):
     """Simulate I/O work: cooperative sleeps that yield to other tasks."""
     rounds = random.randint(3, 6)
-    log(f"worker {worker_id} (IO) starting, {rounds} rounds")
-    for r in range(rounds):
+    for _ in range(rounds):
         # asyncio.sleep yields to the event loop so other tasks can run.
-        delay = random.uniform(0.1, 0.8)
-        log(f"worker {worker_id} (IO) round {r}: awaiting {delay:.2f}s")
-        await asyncio.sleep(delay)
-    log(f"worker {worker_id} (IO) done")
+        await asyncio.sleep(random.uniform(0.1, 0.8))
+    log.info("worker done", worker=worker_id, kind="io", rounds=rounds)
     return ("io", worker_id, rounds)
 
 
@@ -39,16 +43,14 @@ async def cpu_bound(worker_id):
     loop is not starved. Real CPU work blocks the loop, so we ``await
     asyncio.sleep(0)`` periodically to keep things cooperative."""
     iterations = random.randint(2, 5)
-    log(f"worker {worker_id} (CPU) starting, {iterations} chunks")
     total = 0
-    for c in range(iterations):
+    for _ in range(iterations):
         n = random.randint(200_000, 600_000)
-        log(f"worker {worker_id} (CPU) chunk {c}: crunching {n} ints")
         for i in range(n):
             total += i * i
         # Yield to the loop, with a random extra blocking sleep mixed in.
         await asyncio.sleep(random.uniform(0.0, 0.3))
-    log(f"worker {worker_id} (CPU) done, total={total}")
+    log.info("worker done", worker=worker_id, kind="cpu", chunks=iterations)
     return ("cpu", worker_id, total)
 
 
@@ -63,13 +65,12 @@ async def heartbeat(interval=5.0):
     """Background task: periodically log the process PID so you can see the
     app is alive and which process to attach to."""
     while True:
-        log(f"[heartbeat] alive -- PID={os.getpid()}")
+        log.info("heartbeat", pid=os.getpid())
         await asyncio.sleep(interval)
 
 
 async def run_batch(batch):
     """Spawn 10 tasks, run them to completion, report a summary."""
-    log(f"=== batch {batch}: spawning 10 tasks ===")
     start = time.time()
 
     tasks = [asyncio.create_task(worker(i), name=f"worker-{i}") for i in range(10)]
@@ -78,12 +79,14 @@ async def run_batch(batch):
     elapsed = time.time() - start
     io_count = sum(1 for r in results if r and r[0] == "io")
     cpu_count = sum(1 for r in results if r and r[0] == "cpu")
-    log(f"=== batch {batch} done in {elapsed:.2f}s  (io={io_count}, cpu={cpu_count}) ===")
+    log.info(
+        "batch done", batch=batch, elapsed=round(elapsed, 2), io=io_count, cpu=cpu_count
+    )
 
 
 async def main():
     random.seed(os.getpid())
-    log(f"starting up -- PID={os.getpid()}")
+    log.info("starting up", pid=os.getpid())
     # Background task that logs the PID every few seconds.
     hb = asyncio.create_task(heartbeat(5.0), name="heartbeat")
     batch = 0
@@ -94,7 +97,7 @@ async def main():
             # Brief pause between batches so output stays readable.
             await asyncio.sleep(random.uniform(0.2, 1.0))
     except asyncio.CancelledError:
-        log(f"cancelled -- stopping after {batch} batches. Bye!")
+        log.info("cancelled", batches=batch)
     finally:
         hb.cancel()
 

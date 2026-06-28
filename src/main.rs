@@ -9,6 +9,7 @@
 //!      `.glr` file (default), or (`--serve`) serve a live web viewer over HTTP.
 //!      A recorded file is reopened later with `greenlane open <file>`.
 
+mod db;
 mod record;
 mod server;
 mod store;
@@ -28,7 +29,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use store::{GcEvent, Slice, Store};
+use db::Db;
+use store::{GcEvent, Slice};
 
 /// bootstrap_gevent.py with a `__SOCKET_PATH__` placeholder we substitute at runtime.
 const BOOTSTRAP_TEMPLATE: &str = include_str!("bootstrap_gevent.py");
@@ -220,26 +222,26 @@ fn attach(
         (Some(_), None) => None,
     };
 
-    // Both modes feed the same timeline store; --serve also streams it live.
-    let store = Store::new();
+    // Both modes feed the same DB-backed timeline; --serve also serves it live.
+    let db = Db::spawn()?;
     let result = match serve {
         Some(addr) => {
             info!("connected — streaming to viewer (Ctrl-C to stop)");
-            serve_mode(stream, running.clone(), pid, addr, web_dir, store.clone())
+            serve_mode(stream, running.clone(), pid, addr, web_dir, db.clone())
         }
         None => {
             let path = out_path
                 .as_ref()
                 .expect("record mode always has an out path");
             info!(path = %path.display(), "connected — recording (Ctrl-C to stop)");
-            record_to_file(stream, &running, &store, pid, path)
+            record_to_file(stream, &running, &db, pid, path)
         }
     };
     cleanup(&sock_path, &bootstrap_path);
     result?;
 
     if let Some(path) = out_path {
-        record::write(&path, &store.export(pid))?;
+        db.flush_to_file(&path, pid)?;
         info!("wrote recording — open it with: greenlane open {}", path.display());
     }
     Ok(())
@@ -501,19 +503,19 @@ fn serve_mode(
     pid: i32,
     addr: SocketAddr,
     web_dir: Option<PathBuf>,
-    store: Arc<Store>,
+    db: Db,
 ) -> Result<()> {
     // Flipped by POST /detach: stops the collector so the target self-removes
     // its trace hook (the broken socket triggers cleanup in the bootstrap).
     let detached = Arc::new(AtomicBool::new(false));
 
-    // The blocking socket reader stays on its own std thread, feeding the store.
+    // The blocking socket reader stays on its own std thread, feeding the DB.
     let collector = {
         let running = running.clone();
         let detached = detached.clone();
-        let store = store.clone();
+        let db = db.clone();
         std::thread::spawn(move || {
-            if let Err(e) = read_slices(stream, &running, &detached, &store) {
+            if let Err(e) = read_slices(stream, &running, &detached, &db) {
                 error!(error = format!("{e:#}"), "collector error");
             }
         })
@@ -532,7 +534,7 @@ fn serve_mode(
             }
         };
         // Live attach: no recording source.
-        server::serve(store, pid, detached.clone(), None, addr, web_dir, shutdown).await
+        server::serve(db, pid, detached.clone(), None, addr, web_dir, shutdown).await
     })?;
 
     running.store(false, Ordering::SeqCst);
@@ -549,7 +551,7 @@ const RECORD_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 fn record_to_file(
     stream: UnixStream,
     running: &Arc<AtomicBool>,
-    store: &Arc<Store>,
+    db: &Db,
     pid: i32,
     path: &Path,
 ) -> Result<()> {
@@ -557,15 +559,15 @@ fn record_to_file(
     let no_detach = Arc::new(AtomicBool::new(false));
     let collector = {
         let running = running.clone();
-        let store = store.clone();
-        std::thread::spawn(move || read_slices(stream, &running, &no_detach, &store))
+        let db = db.clone();
+        std::thread::spawn(move || read_slices(stream, &running, &no_detach, &db))
     };
 
     let mut next = Instant::now() + RECORD_REPORT_INTERVAL;
     while running.load(Ordering::SeqCst) && !collector.is_finished() {
         std::thread::sleep(Duration::from_millis(200));
         if Instant::now() >= next {
-            flush_and_report(store, pid, path);
+            flush_and_report(db, pid, path);
             next += RECORD_REPORT_INTERVAL;
         }
     }
@@ -577,30 +579,34 @@ fn record_to_file(
 }
 
 /// Flush the current timeline to `path` and log event count + on-disk size.
-fn flush_and_report(store: &Store, pid: i32, path: &Path) {
-    if let Err(e) = record::write(path, &store.export(pid)) {
-        warn!(error = %format!("{e:#}"), "failed to flush partial recording");
-        return;
+fn flush_and_report(db: &Db, pid: i32, path: &Path) {
+    match db.flush_to_file(path, pid) {
+        Ok(bytes) => info!(events = db.total(), bytes, "recording…"),
+        Err(e) => warn!(error = %format!("{e:#}"), "failed to flush partial recording"),
     }
-    let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    info!(events = store.slice_count(), bytes, "recording…");
 }
 
-/// Read the switch stream, closing one [`Slice`] per run-interval into the store.
-/// A greenlet's slice closes when the *next* switch arrives: the time from being
-/// switched-in until being switched-away is attributed to whoever was running.
+/// Read the switch stream, closing one [`Slice`] per run-interval and ingesting
+/// it into the DB. A greenlet's slice closes when the *next* switch arrives: the
+/// time from being switched-in until away is attributed to whoever was running.
+/// Slices/GC are batched before ingest to keep channel traffic down; the batch is
+/// flushed on idle so a live viewer still sees fresh data promptly.
 fn read_slices(
     stream: UnixStream,
     running: &AtomicBool,
     detached: &AtomicBool,
-    store: &Store,
+    db: &Db,
 ) -> Result<()> {
+    /// Slices/GC buffered before a batched ingest.
+    const BATCH: usize = 2048;
     stream.set_read_timeout(Some(Duration::from_millis(500)))?;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     // (gid, start_ns, name, func, task, stack) for the currently-running
     // greenlet — captured when it was switched in (its resume point).
     let mut cur: Option<(u64, u64, String, String, String, String)> = None;
+    let mut pending: Vec<Slice> = Vec::new();
+    let mut pending_gc: Vec<GcEvent> = Vec::new();
 
     while running.load(Ordering::SeqCst) && !detached.load(Ordering::SeqCst) {
         line.clear();
@@ -612,23 +618,26 @@ fn read_slices(
             Ok(n) => {
                 // Count the raw stream volume processed (reported live in the
                 // viewer header), regardless of how the line parses.
-                store.add_bytes(n);
+                db.add_bytes(n);
                 let trimmed = line.trim_end();
                 // Header line: "meta\t<epoch_ms>" — wall-clock at trace t0.
                 if let Some(rest) = trimmed.strip_prefix("meta\t") {
                     if let Ok(ms) = rest.parse::<u64>() {
-                        store.set_epoch(ms);
+                        db.set_epoch(ms);
                     }
                     continue;
                 }
                 // GC pause: "gc\t<start_ns>\t<dur_ns>\t<gen>\t<collected>".
                 if let Some(ev) = trimmed.strip_prefix("gc\t").and_then(parse_gc) {
-                    store.push_gc(ev);
+                    pending_gc.push(ev);
+                    if pending_gc.len() >= BATCH {
+                        db.ingest_gc(std::mem::take(&mut pending_gc));
+                    }
                     continue;
                 }
                 if let Some(ev) = parse_event(trimmed) {
                     if let Some((gid, start, name, func, task, stack)) = cur.take() {
-                        store.push(Slice {
+                        pending.push(Slice {
                             gid,
                             start,
                             dur: ev.ts.saturating_sub(start),
@@ -637,17 +646,36 @@ fn read_slices(
                             task,
                             stack,
                         });
+                        if pending.len() >= BATCH {
+                            db.ingest_slices(std::mem::take(&mut pending));
+                        }
                     }
                     cur = Some((ev.target, ev.ts, ev.label, ev.func, ev.task, ev.stack));
                 }
             }
+            // Idle: flush buffered events so the live viewer sees them promptly.
             Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
+                ) =>
+            {
+                if !pending.is_empty() {
+                    db.ingest_slices(std::mem::take(&mut pending));
+                }
+                if !pending_gc.is_empty() {
+                    db.ingest_gc(std::mem::take(&mut pending_gc));
+                }
+            }
             Err(e) => return Err(e).context("reading event stream"),
         }
+    }
+    // Final flush of anything still buffered.
+    if !pending.is_empty() {
+        db.ingest_slices(pending);
+    }
+    if !pending_gc.is_empty() {
+        db.ingest_gc(pending_gc);
     }
     Ok(())
 }
@@ -660,11 +688,10 @@ fn read_slices(
 /// to stream more.
 fn open(file: &Path, addr: SocketAddr, web_dir: Option<PathBuf>) -> Result<()> {
     let bytes = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
-    let rec = record::read(file)?;
-    let pid = rec.pid;
-    let n = rec.slices.len();
-    let store = Store::from_recording(rec);
-    info!(slices = n, bytes, file = %file.display(), "loaded recording");
+    let db = Db::spawn()?;
+    // Stream the file into the DB chunk-by-chunk (bounded memory on open).
+    let pid = record::ingest_file(file, &db)?;
+    info!(slices = db.total(), bytes, file = %file.display(), "loaded recording");
     let source = Some(server::Source {
         file: file.display().to_string(),
         bytes,
@@ -691,7 +718,7 @@ fn open(file: &Path, addr: SocketAddr, web_dir: Option<PathBuf>) -> Result<()> {
                 }
             }
         };
-        server::serve(store, pid, detached, source, addr, web_dir, shutdown).await
+        server::serve(db, pid, detached, source, addr, web_dir, shutdown).await
     })?;
     Ok(())
 }

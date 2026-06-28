@@ -859,11 +859,12 @@ export class Timeline {
   private drawCpu(cw: number) {
     const ctx = this.ctx;
     const top = RULER_H;
-    // The band is [top, top+CPU_H]; 0% is inset from the bottom and there's a
-    // GAP_H gap before the first track, so the 0% line/label never overlaps the
-    // Hub lane. 100% is inset from the top for the header row.
+    // The band is [top, top+CPU_H]. 0% sits exactly on the band's bottom divider
+    // (top+CPU_H) so the baseline lines up with the background grid; the GAP_H
+    // gap below it keeps the area clear of the first track. 100% is inset from
+    // the top for the header row.
     const plotTop = top + 22;
-    const plotBot = top + CPU_H - 8;
+    const plotBot = top + CPU_H;
     const plotH = plotBot - plotTop;
     const yOf = (f: number) => plotBot - Math.min(1, Math.max(0, f)) * plotH;
 
@@ -948,11 +949,14 @@ export class Timeline {
     ctx.textBaseline = "middle";
     for (const f of [0, 0.5, 1]) {
       const y = yOf(f);
+      // The 0% line is on the bottom divider; lift its label up into the band
+      // so the chip doesn't bleed into the GAP_H gap / first track.
+      const ly = f === 0 ? y - 7 : y;
       const t = `${f * 100}%`;
       ctx.fillStyle = "rgba(13,15,19,0.85)";
-      ctx.fillRect(AXIS_X - 4, y - 6, 32, 12);
+      ctx.fillRect(AXIS_X - 4, ly - 6, 32, 12);
       ctx.fillStyle = "#6b7280";
-      ctx.fillText(t, AXIS_X, y);
+      ctx.fillText(t, AXIS_X, ly);
     }
 
     // Header row: label on the left, current % on the right (no overlap with
