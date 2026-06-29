@@ -13,10 +13,9 @@ one view: which greenlet ran when, what it was doing, and where the hub stalls.
 
 It uses [greenlet.settrace](https://greenlet.readthedocs.io/en/latest/api.html#greenlet.settrace) to observe every cooperative switch on the gevent hub thread.
 
-<video src="https://github.com/mermoldy/greenlane/raw/main/assets/greenlane-demo.mp4" controls muted playsinline width="800">
-  Your browser does not render embedded video —
-  <a href="https://github.com/mermoldy/greenlane/raw/main/assets/greenlane-demo.mp4">download the demo clip</a>.
-</video>
+## Preview
+
+https://github.com/user-attachments/assets/cbf043cb-cedd-409b-99cb-1ed431a04c0e
 
 ## Install
 
