@@ -83,7 +83,13 @@ type WsMsg =
       // Live hub-thread on-CPU rate (ms/s); drives the CPU band's live tail.
       cpuMsPerSec?: number | null;
     }
-  | { type: "slowlog"; rows: SlowRow[]; total: number }
+  | {
+      type: "slowlog";
+      rows: SlowRow[];
+      total: number;
+      warnTotal: number;
+      blockedTotal: number;
+    }
   | { type: "stats"; p50: number; p95: number; p99: number }
   // Lazy per-execution detail (the render-only window frame omits func/task/stack); the
   // viewer requests it on hover and matches the reply back by gid+startNs.
@@ -180,6 +186,10 @@ function App() {
   const [slowSort, setSlowSort] = useState<"time" | "dur">("time");
   const [slowRows, setSlowRows] = useState<SlowRow[]>([]);
   const [slowTotal, setSlowTotal] = useState(0); // true count (uncapped) from DB
+  // Per-tier whole-capture counts (independent of the panel's level filter) — drive
+  // the toggle button's amber (warn-band) and red (block-band) badges.
+  const [slowWarn, setSlowWarn] = useState(0);
+  const [slowBlocked, setSlowBlocked] = useState(0);
   // True while a *fresh* slow-log query (level/sort/open change) is in flight, so
   // the panel can mask the stale rows until the new ones land. Background polls
   // don't set it, so the steady-state refresh doesn't flicker.
@@ -611,6 +621,8 @@ function App() {
           case "slowlog":
             setSlowRows(msg.rows);
             setSlowTotal(msg.total);
+            setSlowWarn(msg.warnTotal);
+            setSlowBlocked(msg.blockedTotal);
             setSlowLoading(false);
             break;
           case "detail": {
@@ -868,7 +880,21 @@ function App() {
             aria-pressed={slowOpen}
             title={`Spans that ran long enough to stall the scheduler (≥${warnMs}ms), queried from the database.`}
           >
-            <IconSlow /> slow log ({slowTotal.toLocaleString()}){" "}
+            <IconSlow /> slow log{" "}
+            <span className="slowbadges">
+              <span
+                className={`slowbadge warn${slowWarn === 0 ? " zero" : ""}`}
+                title={`${slowWarn.toLocaleString()} warning execution${slowWarn === 1 ? "" : "s"} (${warnMs}–${blockMs}ms).`}
+              >
+                {slowWarn.toLocaleString()}
+              </span>
+              <span
+                className={`slowbadge blocked${slowBlocked === 0 ? " zero" : ""}`}
+                title={`${slowBlocked.toLocaleString()} blocked execution${slowBlocked === 1 ? "" : "s"} (≥${blockMs}ms).`}
+              >
+                {slowBlocked.toLocaleString()}
+              </span>
+            </span>{" "}
             {slowOpen ? "▾" : "▸"}
           </button>
           <span className="bbsep" aria-hidden="true" />
@@ -927,9 +953,6 @@ function App() {
                 setColorMode(m);
               }}
             >
-              <option value="ident" title="A stable color per greenlet.">
-                identity
-              </option>
               <option
                 value="duration"
                 title="Color executions by how long they ran: blue < warn, yellow < block, red beyond. Hub stays green."
@@ -941,6 +964,9 @@ function App() {
                 title="Color executions on a continuous cool→hot gradient by run length (log-scaled): dark/indigo for short runs, yellow for the longest. Hub stays green."
               >
                 heatmap
+              </option>
+              <option value="ident" title="A stable color per greenlet.">
+                identity
               </option>
             </select>
           </label>

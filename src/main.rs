@@ -1182,8 +1182,8 @@ struct Report {
     p99_ns: u64,
     #[serde(rename = "warnCount")]
     warn_count: u64,
-    #[serde(rename = "blockCount")]
-    block_count: u64,
+    #[serde(rename = "blockedCount")]
+    blocked_count: u64,
     #[serde(rename = "gcCount")]
     gc_count: u64,
     #[serde(rename = "gcTotalNs")]
@@ -1242,7 +1242,7 @@ fn analyze(file: &Path, format: AnalyzeFormat, top: usize, thresholds: Threshold
         hub_run_ns,
         nonhub_run_ns,
         warn_count,
-        block_count,
+        blocked_count,
         top_greenlets,
         top_funcs,
         gc_count,
@@ -1275,7 +1275,7 @@ fn analyze(file: &Path, format: AnalyzeFormat, top: usize, thresholds: Threshold
         p95_ns: p95 as u64,
         p99_ns: p99 as u64,
         warn_count,
-        block_count,
+        blocked_count,
         gc_count,
         gc_total_ns,
         gc_by_gen,
@@ -1352,7 +1352,7 @@ fn print_report_text(r: &Report) {
     println!("\nSlow executions (≥ warn {}ms)", r.warn_ms);
     println!(
         "  warn: {}   block (≥ {}ms): {}",
-        r.warn_count, r.block_ms, r.block_count
+        r.warn_count, r.block_ms, r.blocked_count
     );
     if !r.slowest.is_empty() {
         println!("  slowest:");

@@ -50,9 +50,12 @@ const CPU_H = 60; // CPU graph band under the ruler, CSS px
 const LAG_H = 30; // kernel scheduler-lag band under the CPU band (R13), CSS px
 const GAP_H = 7; // gap between the lag band and the first track
 const HEADER_H = RULER_H + CPU_H + LAG_H + GAP_H; // tracks begin below this
-// Lag band shown as "fully starved" (band top): runqueue wait ≥ this many ms per
-// wall-second. Picked so routine sub-ms jitter stays low and real starvation fills.
-const LAG_FULL_MS_S = 100;
+// The lag band auto-scales its y-axis to the tallest sample in the visible window
+// (a fixed ceiling either clamps real spikes or squashes quiet stretches — 10 and
+// 500 ms/s ended up at the same height). This is the *floor* for that full-scale
+// value: until lag exceeds it, the band tops out here so routine sub-ms jitter
+// stays low instead of being amplified to fill the band.
+const LAG_MIN_FULL_MS_S = 50;
 const AXIS_X = 6; // shared left inset for axis labels (CPU % and track names)
 
 // Hover explanations for the "?" badges on the CPU and scheduler-lag band headers.
@@ -64,10 +67,12 @@ const LAG_HELP =
   "Kernel run-queue delay for the hub thread: milliseconds it was runnable but " +
   "NOT on a CPU, per wall-second (from /proc schedstat). It's a rate out of " +
   "1000 ms/s — e.g. 200 ms/s means 20% of wall-time was spent waiting for a core. " +
-  "Rough scale: <5 = healthy, 5–50 = some contention, ≥50 worth investigating, " +
-  "≥100 (band full) = severe starvation (oversubscription / cgroup·k8s CFS " +
-  "throttling). High lag means a long execution here was off-CPU waiting to run, not " +
-  "your code being slow. Linux-only.";
+  "Rough scale: <5 = healthy, 5–50 = some contention, ≥50 worth investigating — " +
+  "severe starvation (oversubscription / cgroup·k8s CFS throttling) climbs from " +
+  "there. The band's y-axis auto-scales to the tallest lag in view (its full-scale " +
+  "value is shown at the band top), so heights are relative to the current window. " +
+  "High lag means a long execution here was off-CPU waiting to run, not your code " +
+  "being slow. Linux-only.";
 const INIT_CAP = 1 << 14; // ~16k executions preallocated (cheap doubling grows after)
 // When a full window load leaves the buffer this many times larger than what's
 // actually held, shrink it back down so resident memory tracks the working set
@@ -1987,6 +1992,12 @@ export class Timeline {
     }
     const cur = n > 0 ? col[cw - 1] : 0; // latest (right-edge) value for the header
 
+    // Auto-scale the band to the tallest lag now in view so both quiet and
+    // starved regimes stay legible; floored so near-zero jitter doesn't fill it.
+    let peak = 0;
+    for (let x = 0; x < cw; x++) if (col[x] > peak) peak = col[x];
+    const fullScale = Math.max(peak, LAG_MIN_FULL_MS_S);
+
     // Baseline guide (0 lag) — on the band's bottom divider.
     ctx.strokeStyle = "rgba(120,130,150,0.12)";
     ctx.beginPath();
@@ -1998,7 +2009,7 @@ export class Timeline {
       // Area.
       ctx.beginPath();
       ctx.moveTo(0, plotBot);
-      for (let x = 0; x < cw; x++) ctx.lineTo(x, yOf(col[x] / LAG_FULL_MS_S));
+      for (let x = 0; x < cw; x++) ctx.lineTo(x, yOf(col[x] / fullScale));
       ctx.lineTo(cw, plotBot);
       ctx.closePath();
       ctx.fillStyle = this.rgba(this.tBlock, 0.18); // red-ish: starvation
@@ -2006,13 +2017,20 @@ export class Timeline {
       // Line.
       ctx.beginPath();
       for (let x = 0; x < cw; x++) {
-        const y = yOf(col[x] / LAG_FULL_MS_S);
+        const y = yOf(col[x] / fullScale);
         if (x === 0) ctx.moveTo(x, y);
         else ctx.lineTo(x, y);
       }
       ctx.strokeStyle = this.tBlock;
       ctx.lineWidth = 1;
       ctx.stroke();
+
+      // Full-scale marker: the band auto-scales, so label what its top now means.
+      ctx.font = "9px ui-monospace, Menlo, monospace";
+      ctx.fillStyle = this.rgba(this.tMuted, 0.7);
+      ctx.textAlign = "left";
+      ctx.textBaseline = "top";
+      ctx.fillText(`${Math.round(fullScale)} ms/s`, AXIS_X, plotTop + 1);
     }
 
     // Header row: label + latest rate.
@@ -2045,7 +2063,7 @@ export class Timeline {
     ) {
       const x = Math.max(0, Math.min(cw - 1, Math.round(this.mouseX)));
       const v = col[x];
-      const y = yOf(v / LAG_FULL_MS_S);
+      const y = yOf(v / fullScale);
       ctx.fillStyle = this.tBlock;
       ctx.beginPath();
       ctx.arc(x, y, 3, 0, Math.PI * 2);

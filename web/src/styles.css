@@ -300,6 +300,34 @@ button.danger:hover:not(:disabled) {
   padding: 2px 9px;
   font-size: 12px;
 }
+/* Per-tier count pills on the slow-log toggle: amber = warn band, red = block
+   band. Dark text rides on the saturated fills; a zero count is dimmed so an
+   empty red badge doesn't read as an alert. */
+.slowtoggle .slowbadges {
+  display: inline-flex;
+  gap: 3px;
+  vertical-align: baseline;
+}
+.slowtoggle .slowbadge {
+  min-width: 12px;
+  padding: 0 3px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 14px;
+  text-align: center;
+  color: var(--bg-app);
+}
+.slowtoggle .slowbadge.warn {
+  background: var(--ac-warn);
+}
+.slowtoggle .slowbadge.blocked {
+  background: var(--ac-block);
+}
+.slowtoggle .slowbadge.zero {
+  opacity: 0.4;
+}
 /* Vertical rule separating control clusters within a bottom-bar group. */
 .bottombar .bbsep {
   flex: none;

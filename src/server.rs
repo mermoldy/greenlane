@@ -672,10 +672,17 @@ async fn handle_request(st: &AppState, text: &str) -> Option<Message> {
                 // `serde_json::Value` tree) — this is polled with up to 5000 rows
                 // every second while the panel is open, so the per-row allocations a
                 // `json!` macro would build are worth avoiding.
-                Ok(Reply::Slowlog { rows, total }) => Some(json_text(&SlowlogMsg {
+                Ok(Reply::Slowlog {
+                    rows,
+                    total,
+                    warn_total,
+                    blocked_total,
+                }) => Some(json_text(&SlowlogMsg {
                     ty: "slowlog",
                     rows: &rows,
                     total,
+                    warn_total,
+                    blocked_total,
                 })),
                 _ => None,
             }
@@ -745,6 +752,10 @@ struct SlowlogMsg<'a> {
     ty: &'static str,
     rows: &'a [crate::db::SlowRow],
     total: usize,
+    #[serde(rename = "warnTotal")]
+    warn_total: usize,
+    #[serde(rename = "blockedTotal")]
+    blocked_total: usize,
 }
 
 #[derive(Serialize)]

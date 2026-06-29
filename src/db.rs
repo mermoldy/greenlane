@@ -204,6 +204,12 @@ pub enum Reply {
         rows: Vec<SlowRow>,
         /// Total matching slow executions (before the display limit) — for the badge.
         total: usize,
+        /// Whole-capture warn-band count (warn <= dur < block), independent of the
+        /// requested tier — drives the toggle button's amber badge.
+        warn_total: usize,
+        /// Whole-capture block-band count (dur >= block), independent of the
+        /// requested tier — drives the toggle button's red badge.
+        blocked_total: usize,
     },
     Stats {
         p50: f64,
@@ -226,7 +232,7 @@ pub enum Reply {
         /// Non-Hub executions at/over the warn threshold.
         warn_count: u64,
         /// Non-Hub executions at/over the block threshold.
-        block_count: u64,
+        blocked_count: u64,
         /// Top greenlets by run time, longest first (bounded by `top`).
         top_greenlets: Vec<GreenletAgg>,
         /// Hottest non-Hub functions by total run time (bounded by `top`).
@@ -1059,6 +1065,8 @@ fn slowlog(
             return Ok(Reply::Slowlog {
                 rows: Vec::new(),
                 total: 0,
+                warn_total: 0,
+                blocked_total: 0,
             });
         }
         Some(df) => df,
@@ -1074,19 +1082,43 @@ fn slowlog(
             .and(dur.clone().lt(lit(red_ns as i64))),
         SlowTier::Block => dur.clone().gt_eq(lit(red_ns as i64)),
     };
-    // Filter once; reuse the lazy plan for both the count and the page so the
-    // sort + limit run inside Polars rather than materializing every match and
-    // sorting/truncating in Rust.
+    // Filter once for the page; the sort + limit run inside Polars rather than
+    // materializing every match and sorting/truncating in Rust.
     let filtered = df.clone().lazy().filter(col("is_hub").not().and(tier_pred));
 
-    // `total` is the real number of matching slow executions (drives the badge);
-    // computed as an aggregation so it doesn't materialize the rows.
-    let count = filtered
+    // Whole-capture band counts (hub excluded), computed in one aggregation pass so
+    // the rows are never materialized. These are independent of the requested tier
+    // — they drive the toggle button's amber (warn-band) and red (block-band)
+    // badges — and `total` for the panel is derived from them per tier.
+    let nonhub = || col("is_hub").not();
+    let bands = df
         .clone()
-        .select([len().cast(DataType::Int64).alias("n")])
+        .lazy()
+        .select([
+            col("dur")
+                .filter(
+                    nonhub()
+                        .and(col("dur").gt_eq(lit(warn_ns as i64)))
+                        .and(col("dur").lt(lit(red_ns as i64))),
+                )
+                .count()
+                .cast(DataType::Int64)
+                .alias("warn_n"),
+            col("dur")
+                .filter(nonhub().and(col("dur").gt_eq(lit(red_ns as i64))))
+                .count()
+                .cast(DataType::Int64)
+                .alias("block_n"),
+        ])
         .collect()
-        .context("slowlog count")?;
-    let total = get_i64(&count, "n").max(0) as usize;
+        .context("slowlog band counts")?;
+    let warn_total = get_i64(&bands, "warn_n").max(0) as usize;
+    let blocked_total = get_i64(&bands, "block_n").max(0) as usize;
+    let total = match tier {
+        SlowTier::All => warn_total + blocked_total,
+        SlowTier::Warn => warn_total,
+        SlowTier::Block => blocked_total,
+    };
 
     // Sort + limit pushed into Polars: longest-first by dur, else newest-first by
     // start. Both are descending; `limit` bounds the rows shipped for display.
@@ -1105,7 +1137,7 @@ fn slowlog(
             col("func"),
         ])
         .collect()
-        .context("slowlog query")?;
+        .context("slowlog page")?;
 
     let h = out.height();
     let start = out.column("start")?.i64()?;
@@ -1126,7 +1158,12 @@ fn slowlog(
             }
         })
         .collect();
-    Ok(Reply::Slowlog { rows, total })
+    Ok(Reply::Slowlog {
+        rows,
+        total,
+        warn_total,
+        blocked_total,
+    })
 }
 
 fn stats(df: Option<&DataFrame>, t0: u64, t1: u64) -> Result<Reply> {
@@ -1192,7 +1229,7 @@ fn summary(tl: &Timeline, warn_ns: u64, red_ns: u64, top: usize) -> Result<Reply
                 hub_run_ns: 0,
                 nonhub_run_ns: 0,
                 warn_count: 0,
-                block_count: 0,
+                blocked_count: 0,
                 top_greenlets: Vec::new(),
                 top_funcs: Vec::new(),
                 gc_count,
@@ -1232,7 +1269,7 @@ fn summary(tl: &Timeline, warn_ns: u64, red_ns: u64, top: usize) -> Result<Reply
     let hub_run_ns = get_i64(&agg, "hub_run").max(0) as u64;
     let nonhub_run_ns = get_i64(&agg, "nonhub_run").max(0) as u64;
     let warn_count = get_i64(&agg, "warn_n").max(0) as u64;
-    let block_count = get_i64(&agg, "block_n").max(0) as u64;
+    let blocked_count = get_i64(&agg, "block_n").max(0) as u64;
 
     // Top greenlets by total run time (longest first).
     let greenlet_df = df
@@ -1307,7 +1344,7 @@ fn summary(tl: &Timeline, warn_ns: u64, red_ns: u64, top: usize) -> Result<Reply
         hub_run_ns,
         nonhub_run_ns,
         warn_count,
-        block_count,
+        blocked_count,
         top_greenlets,
         top_funcs,
         gc_count,
@@ -1647,8 +1684,15 @@ mod tests {
             .await
             .unwrap();
         match all {
-            Reply::Slowlog { rows, total } => {
+            Reply::Slowlog {
+                rows,
+                total,
+                warn_total,
+                blocked_total,
+            } => {
                 assert_eq!(total, 2); // gid 2 and 3, Hub excluded
+                assert_eq!(warn_total, 1); // gid 2 in the warn band
+                assert_eq!(blocked_total, 1); // gid 3 in the block band
                 assert_eq!(rows[0].gid, 3); // sorted by dur desc
                 assert_eq!(rows[0].level, 2); // block tier
             }
@@ -1665,7 +1709,7 @@ mod tests {
             .await
             .unwrap();
         match block {
-            Reply::Slowlog { rows, total } => {
+            Reply::Slowlog { rows, total, .. } => {
                 assert_eq!(total, 1); // only gid 3
                 assert_eq!(rows[0].gid, 3);
             }
@@ -1684,7 +1728,7 @@ mod tests {
             .await
             .unwrap();
         match warn {
-            Reply::Slowlog { rows, total } => {
+            Reply::Slowlog { rows, total, .. } => {
                 assert_eq!(total, 1); // only gid 2
                 assert_eq!(rows[0].gid, 2);
                 assert_eq!(rows[0].level, 1); // warn tier
@@ -1756,7 +1800,7 @@ mod tests {
                 hub_run_ns,
                 nonhub_run_ns,
                 warn_count,
-                block_count,
+                blocked_count,
                 top_greenlets,
                 top_funcs,
                 gc_count,
@@ -1767,7 +1811,7 @@ mod tests {
                 assert_eq!(hub_run_ns, 500 * MS);
                 assert_eq!(nonhub_run_ns, (25 + 80 + 1) * MS); // hub excluded
                 assert_eq!(warn_count, 2); // gid 1 (25ms) + gid 2 (80ms)
-                assert_eq!(block_count, 1); // only gid 2
+                assert_eq!(blocked_count, 1); // only gid 2
                 // Top greenlet by run time is the Hub (500ms).
                 assert_eq!(top_greenlets[0].gid, 9);
                 assert!(top_greenlets[0].is_hub);
