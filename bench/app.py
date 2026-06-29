@@ -2,8 +2,9 @@
 
 Drives a pool of greenlets through a randomised workload so the timeline shows a
 realistic mix: most jobs are fast cooperative I/O, a fraction are heavier
-CPU-bound bursts, and a rare few are very slow — exactly the shape the slow-log
-and span highlights are built to surface.
+CPU-bound bursts, some churn cyclic garbage to trigger GC pauses, and a rare few
+are very slow — exactly the shape the slow-log, GC markers, and span highlights
+are built to surface.
 
 Both knobs are parametrised:
 
@@ -26,6 +27,7 @@ import os
 import random
 import signal
 import time
+from collections import deque
 
 import gevent
 import greenlet
@@ -118,6 +120,34 @@ def _deep_leaf():
     return total
 
 
+# ── Cyclic garbage ───────────────────────────────────────────────────────────
+# greenlane's only non-switch event is the CPython cyclic garbage collector
+# (gc.callbacks), and a collection pauses the whole gevent thread — so it's worth
+# surfacing on the timeline. But the rest of this generator allocates almost
+# nothing the cyclic collector tracks (int arithmetic, sleeps), so GC events would
+# be rare. This deliberately manufactures reference cycles to give it work.
+#
+# A bounded pool keeps some cycles alive across rounds: survivors are promoted
+# gen0 → gen1 → gen2, so collections fire in every generation (not just cheap
+# gen0 sweeps) and eviction from the pool is what finally frees the oldest.
+_cycle_pool = deque(maxlen=20_000)
+
+
+def _make_cycles(n):
+    """Allocate `n` reference cycles to give the cyclic collector real work. Each
+    is a pair of dicts that point at each other (plus a self-loop), so they're
+    reclaimable only by the cyclic collector, never by refcounting. Odd-indexed
+    ones are parked in `_cycle_pool` to age into higher generations; the rest go
+    unreachable immediately and are swept from gen0."""
+    for k in range(n):
+        a = {}
+        b = {"peer": a}
+        a["peer"] = b
+        a["self"] = a
+        if k & 1:
+            _cycle_pool.append(a)
+
+
 def workload(i):
     """One job. Randomly picks a profile so the timeline stays varied."""
     r = random.random()
@@ -142,6 +172,13 @@ def workload(i):
         # Deep call chain: tall trace stacks for the stack viewer / --include-traces.
         handle_request(_deep_leaf)
         return "deep"
+    if r < 0.28:
+        # Cyclic garbage: churn reference cycles so CPython's cyclic collector
+        # fires and the timeline shows GC pause events (across generations as
+        # pooled survivors age out). Yield so it stays cooperative.
+        _make_cycles(random.randint(2_000, 6_000))
+        gevent.sleep(random.uniform(0.0005, 0.005))
+        return "gc"
     # The common case: fast I/O.
     gevent.sleep(random.uniform(0.0005, 0.025))
     return "io"
