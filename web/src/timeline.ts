@@ -240,33 +240,21 @@ function hexToRgb01(hex: string): [number, number, number] {
   return [r / 255, g / 255, b / 255];
 }
 
-// "heatmap" color mode: a continuous inferno-style gradient (cool→hot) by run
-// length, so duration reads as intensity rather than the three discrete bands of
-// "duration" mode. Stops climb dark-indigo → purple → magenta → orange → yellow:
-// perceptually monotonic, bright enough to stay legible on the dark track, and it
-// avoids green (the Hub's reserved color). Position is log-scaled (see heatRgb).
-const HEAT_STOPS: Array<[number, [number, number, number]]> = [
-  [0.0, [0.15, 0.16, 0.45]], // dark indigo — coolest / shortest
-  [0.3, [0.4, 0.18, 0.58]], // purple
-  [0.55, [0.74, 0.21, 0.45]], // magenta-red
-  [0.78, [0.93, 0.45, 0.18]], // orange
-  [1.0, [0.98, 0.86, 0.32]], // yellow — hottest / longest
-];
-function heatGradient(t: number): [number, number, number] {
-  const x = t <= 0 ? 0 : t >= 1 ? 1 : t;
-  for (let i = 1; i < HEAT_STOPS.length; i++) {
-    const [p1, c1] = HEAT_STOPS[i];
-    if (x <= p1) {
-      const [p0, c0] = HEAT_STOPS[i - 1];
-      const f = (x - p0) / (p1 - p0);
-      return [
-        c0[0] + (c1[0] - c0[0]) * f,
-        c0[1] + (c1[1] - c0[1]) * f,
-        c0[2] + (c1[2] - c0[2]) * f,
-      ];
-    }
-  }
-  return HEAT_STOPS[HEAT_STOPS.length - 1][1];
+// "heatmap" color mode: a continuous blue → yellow → red gradient anchored to the
+// duration thresholds (see heatRgb) — the same blue/yellow/red as "duration" mode,
+// but interpolated so duration reads as intensity rather than three discrete bands.
+
+/** Linear blend between two 0..1 RGB triples at fraction `f` (0 → a, 1 → b). */
+function lerpRgb(
+  a: [number, number, number],
+  b: [number, number, number],
+  f: number,
+): [number, number, number] {
+  return [
+    a[0] + (b[0] - a[0]) * f,
+    a[1] + (b[1] - a[1]) * f,
+    a[2] + (b[2] - a[2]) * f,
+  ];
 }
 
 // Stable greenlet color keyed off the greenlet NAME (not insertion index), so a
@@ -335,7 +323,7 @@ export type SortMode =
 
 // How execution fill is colored: "ident" = a stable per-greenlet color (default);
 // "duration" = blue/yellow/red by run length (Hub stays green); "heatmap" = a
-// continuous cool→hot gradient by run length (log-scaled; Hub stays green).
+// continuous blue→yellow→red gradient anchored to the warn/block thresholds (Hub green).
 export type ColorMode = "ident" | "duration" | "heatmap";
 
 export class Timeline {
@@ -1163,17 +1151,28 @@ export class Timeline {
         : OK_COLOR;
   }
 
-  /** Heatmap-mode RGB for a execution of `durMs` (non-Hub): log-scaled position
-   *  from a sub-millisecond floor up to the block threshold, mapped onto the
-   *  cool→hot gradient. Log scale so the common short runs still spread across the
-   *  cool end instead of all collapsing to one color. */
+  /** Heatmap-mode RGB for an execution of `durMs` (non-Hub): a continuous
+   *  blue → yellow → red gradient anchored to the duration thresholds — absolute
+   *  blue at/under 1ms, absolute yellow at the warn threshold, absolute red
+   *  at/over the block threshold, dynamically interpolated between. Uses the same
+   *  anchor colors as "duration" mode so the two read consistently. The cool
+   *  (blue→yellow) leg is log-scaled, since it spans the many sub-warn runs that
+   *  would otherwise bunch up near blue; the narrow warn→block leg is linear. */
   private heatRgb(durMs: number): [number, number, number] {
-    const floor = 0.5; // ms — at/below this is the coolest color
-    const top = Math.max(this.slowMs, this.warnMs * 2, floor * 4); // hottest at/above
-    const t =
-      (Math.log(Math.max(durMs, floor)) - Math.log(floor)) /
-      (Math.log(top) - Math.log(floor));
-    return heatGradient(t);
+    const floor = 1; // ms — at/below this is absolute blue
+    const clamp01 = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x);
+    if (durMs <= floor) return OK_COLOR;
+    if (durMs >= this.slowMs) return this.durSlowRgb;
+    if (durMs <= this.warnMs) {
+      // blue → yellow, log-scaled across (1ms, warn].
+      const denom = Math.log(this.warnMs) - Math.log(floor);
+      const t = denom > 0 ? (Math.log(durMs) - Math.log(floor)) / denom : 1;
+      return lerpRgb(OK_COLOR, this.durWarnRgb, clamp01(t));
+    }
+    // yellow → red, linear across (warn, block).
+    const denom = this.slowMs - this.warnMs;
+    const t = denom > 0 ? (durMs - this.warnMs) / denom : 1;
+    return lerpRgb(this.durWarnRgb, this.durSlowRgb, clamp01(t));
   }
 
   /** Record the absolute ns range a freshly-loaded window covers, so the frame

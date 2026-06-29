@@ -941,7 +941,7 @@ function App() {
           </label>
           <label
             className="ctl"
-            title="Greenlet fill color: by greenlet identity, by execution duration (blue < warn, yellow < block, red beyond), or as a heatmap (continuous cool→hot gradient by run length). Hub stays green."
+            title="Greenlet fill color: by greenlet identity, by execution duration (blue < warn, yellow < block, red beyond), or as a heatmap (continuous blue→yellow→red gradient by run length, anchored to the warn/block thresholds). Hub stays green."
           >
             <IconColor />
             <select
@@ -961,7 +961,7 @@ function App() {
               </option>
               <option
                 value="heatmap"
-                title="Color executions on a continuous cool→hot gradient by run length (log-scaled): dark/indigo for short runs, yellow for the longest. Hub stays green."
+                title="Color executions on a continuous blue→yellow→red gradient by run length: blue at/under 1ms, yellow at the warn threshold, red at/over the block threshold, interpolated between (cool leg log-scaled). Hub stays green."
               >
                 heatmap
               </option>
