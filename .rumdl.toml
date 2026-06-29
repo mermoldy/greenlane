@@ -4,6 +4,7 @@
 disable = [
   "MD013", # line length — prettier owns wrapping
   "MD033", # inline HTML — docs use raw HTML
+  "MD034", # bare URLs — required for GitHub video/user-attachments embeds
   "MD041", # first line need not be a top-level heading
   "MD060", # table column alignment — prettier owns table formatting
 ]
