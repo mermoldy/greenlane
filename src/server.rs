@@ -95,7 +95,7 @@ fn spawn_stats_monitor(db: Db, detached: Arc<AtomicBool>, tracer_stalled: Arc<At
 }
 
 /// Hard cap on executions returned per viewport window (memory bound).
-const WINDOW_CAP: usize = 200_000;
+const WINDOW_CAP: usize = 2_000_000;
 
 /// Provenance of an opened recording, surfaced to the viewer for context.
 #[derive(Clone)]

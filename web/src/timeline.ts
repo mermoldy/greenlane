@@ -78,7 +78,7 @@ const SHRINK_SLACK = 4;
 // re-fetching the whole window. Past this many buffered rows it does one full
 // (re-centered) window load instead, bounding memory + keeping the f32 GPU-relative
 // `start` base near the view. Matches the server's WINDOW_CAP.
-const APPEND_MAX_ROWS = 200_000;
+const APPEND_MAX_ROWS = 2_000_000;
 const WARN_MS = 20; // executions longer than this get a yellow border
 const SLOW_MS = 50; // executions longer than this get a red border
 const BIN_MS = 1; // CPU histogram resolution: non-Hub run-time per 1ms bin

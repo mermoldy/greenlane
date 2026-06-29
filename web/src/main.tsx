@@ -1302,7 +1302,7 @@ function SlowLog({
               onClick={() => onLevel("block")}
               title={`Blocking tier: ≥ ${blockMs}ms — long enough to stall the scheduler.`}
             >
-              block
+              blocked
             </button>
           </span>
         </span>
