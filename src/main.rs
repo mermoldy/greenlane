@@ -895,14 +895,31 @@ fn read_executions(
     let mut pending_gc: Vec<GcEvent> = Vec::new();
     let mut last_flush = Instant::now();
 
+    // Set if the framed stream goes corrupt: the format is stateful (interned pools,
+    // ts base) and has no resync marker, so we can't reliably continue decoding — but
+    // we MUST NOT kill the collector with an error (that froze ingestion silently).
+    // Instead we stop cleanly, keep everything decoded so far, and let the stall
+    // monitor surface it to the viewer.
+    let mut decode_err = false;
     while running.load(Ordering::SeqCst) && !detached.load(Ordering::SeqCst) {
         // Drain every complete frame currently buffered.
         let mut consumed = 0usize;
         loop {
-            match dec
-                .step(&buf[consumed..])
-                .context("decoding event stream")?
-            {
+            let step = match dec.step(&buf[consumed..]) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        error = %format!("{e:#}"),
+                        consumed,
+                        buffered = buf.len(),
+                        "event stream decode error — stopping collector (stream corrupt); \
+                         keeping the executions captured so far"
+                    );
+                    decode_err = true;
+                    break;
+                }
+            };
+            match step {
                 Step::NeedMore => break,
                 Step::Done { item, consumed: n } => {
                     consumed += n;
@@ -977,6 +994,12 @@ fn read_executions(
         if consumed > 0 {
             buf.drain(0..consumed);
         }
+        // Stream went corrupt: stop the read loop now (the final flush below keeps
+        // everything decoded up to here). The session's data freezes at this point;
+        // the server's stall monitor flags it so the viewer stops chasing the edge.
+        if decode_err {
+            break;
+        }
 
         // Time-bounded flush: push what we've decoded so far if enough time has
         // passed, even while bytes keep arriving (so the idle branch below never
@@ -1029,7 +1052,13 @@ fn read_executions(
                 }
                 last_flush = Instant::now();
             }
-            Err(e) => return Err(e).context("reading event stream"),
+            // A real socket error (e.g. connection reset): the stream is over. Stop
+            // cleanly — break to the final flush so the executions we already have are
+            // preserved — rather than propagating an error that drops them.
+            Err(e) => {
+                warn!(error = %e, "event stream read error — stopping collector");
+                break;
+            }
         }
     }
     // Close each thread's still-running interval at THAT thread's last observed

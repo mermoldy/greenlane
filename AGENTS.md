@@ -49,7 +49,7 @@ from a cold target dir, so reserve the full build for the pre-handoff run above
 and for CI/release.
 
 The pre-commit suite includes general file hygiene, `cargo fmt`, Ruff lint and
-format, Prettier, markdownlint, TypeScript type checking, `ty`, pytest, Bun
+format, Prettier, rumdl (markdown), TypeScript type checking, `ty`, pytest, Bun
 tests, and lychee in offline mode.
 
 ## Development Notes

@@ -1573,9 +1573,19 @@ mod tests {
                 assert_eq!(start.len(), 2);
                 assert!(gid.contains(&3));
                 assert!(gid.contains(&4));
-                assert!(!gid.contains(&1), "span straddling the frontier is not re-sent");
-                assert!(!gid.contains(&2), "row at exactly the frontier is not duplicated");
-                assert_eq!(max_start, 45 * MS, "max_start is the viewer's next frontier");
+                assert!(
+                    !gid.contains(&1),
+                    "span straddling the frontier is not re-sent"
+                );
+                assert!(
+                    !gid.contains(&2),
+                    "row at exactly the frontier is not duplicated"
+                );
+                assert_eq!(
+                    max_start,
+                    45 * MS,
+                    "max_start is the viewer's next frontier"
+                );
             }
             _ => panic!("expected Window reply"),
         }

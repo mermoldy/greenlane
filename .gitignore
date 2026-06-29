@@ -31,3 +31,6 @@ venv/
 .idea/
 .vscode/
 .env
+
+# ── Private local scripts (deploy targets, personal config) ──
+*.local.sh

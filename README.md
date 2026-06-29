@@ -7,7 +7,7 @@
 ![slop](https://img.shields.io/badge/slop-100%25-brightgreen)
 
 greenlane is a live timeline profiler for gevent applications. It attaches to a running
-Python process and records scheduler activity and renders it on a zoomable web timeline. 
+Python process and records scheduler activity and renders it on a zoomable web timeline.
 It shows the gevent hub scheduler, the garbage collector, and your own call stacks in
 one view: which greenlet ran when, what it was doing, and where the hub stalls.
 

@@ -429,6 +429,12 @@ export class Timeline {
   // axis with no cross-process clock mapping. Bounded ring (oldest dropped).
   private lagT: number[] = [];
   private lagV: number[] = [];
+  // Live hub-thread CPU-utilization samples ([0,1] fraction) at trace time `cpuT`
+  // (ms since t0), pushed from each live `head`. Like lag, these are an execution-
+  // stream-independent /proc measure, so they keep the CPU band's tail moving in the
+  // pending area (ahead of the lagging trace data). Bounded ring (oldest dropped).
+  private cpuT: number[] = [];
+  private cpuV: number[] = [];
   // Whether the GC marker layer is drawn (toggleable from the toolbar). The data
   // is always collected/counted; this only gates rendering + hover readout.
   showGc = true;
@@ -454,6 +460,11 @@ export class Timeline {
   // so the follow edge advances in real time and the arrival lag is visible; when
   // false (recording) the edge is the end of the captured data.
   live = false;
+  // Server flagged the tracer as stalled (live, but executions stopped advancing —
+  // the target's switch hook went quiet). Treated like non-live for the edge/lag so
+  // the view stops chasing the wall clock; auto-clears when data resumes. Set by the
+  // app from `head.stalled`.
+  tracerStalled = false;
 
   // ── Viewport windowing ────────────────────────────────────────────────
   // Only the visible window's executions live in memory; the server is queried as
@@ -841,6 +852,8 @@ export class Timeline {
     this.gcColl = [];
     this.lagT = [];
     this.lagV = [];
+    this.cpuT = [];
+    this.cpuV = [];
     this.maxDurMs = 0;
     // Streaming state: drop the loaded window + live-follow cursors so the next load
     // starts fresh (a full window, never an append against stale data). Needed on a
@@ -1044,20 +1057,45 @@ export class Timeline {
     }
   }
 
+  /** Record a live hub-thread CPU sample at the current live edge. `cpuMsPerSec` is
+   *  on-CPU ms per wall-second (server `head`); stored as a [0,1] utilization fraction
+   *  and plotted as the CPU band's live tail in the pending area. null → no sample. */
+  addCpuSample(spanNs: number, cpuMsPerSec: number | null) {
+    if (cpuMsPerSec == null || !isFinite(cpuMsPerSec)) return;
+    this.dirty = true;
+    const t = spanNs / 1e6;
+    const frac = Math.max(0, Math.min(1, cpuMsPerSec / 1000));
+    const n = this.cpuT.length;
+    if (n && t <= this.cpuT[n - 1]) {
+      this.cpuV[n - 1] = frac; // coalesce duplicate edges
+      return;
+    }
+    this.cpuT.push(t);
+    this.cpuV.push(frac);
+    if (this.cpuT.length > 36_000) {
+      this.cpuT.shift();
+      this.cpuV.shift();
+    }
+  }
+
   /** The live edge in trace-relative ms: "now" (wall clock) for a live session,
    *  else the end of captured data. `max` with the data span guards against clock
    *  skew so real executions are never clipped past the edge. */
   liveEdgeMs(): number {
-    if (this.live && Number.isFinite(this.epochMs)) {
+    // A stalled tracer (server says executions stopped advancing) is treated like a
+    // non-live session for the edge: clamp to the data span so the view stops
+    // chasing the wall clock into empty space (and stops re-polling for nothing).
+    if (this.live && !this.tracerStalled && Number.isFinite(this.epochMs)) {
       return Math.max(Date.now() - this.epochMs, this.fullSpanMs);
     }
     return this.fullSpanMs;
   }
 
   /** Arrival lag (ms): how far the latest rendered data trails real time — i.e.
-   *  "now" minus the newest captured span. 0 for recordings / unknown epoch. */
+   *  "now" minus the newest captured span. 0 for recordings / unknown epoch / a
+   *  stalled tracer (no live edge to trail). */
   liveLagMs(): number {
-    if (this.live && Number.isFinite(this.epochMs)) {
+    if (this.live && !this.tracerStalled && Number.isFinite(this.epochMs)) {
       return Math.max(0, Date.now() - this.epochMs - this.fullSpanMs);
     }
     return 0;
@@ -1179,6 +1217,7 @@ export class Timeline {
     return (
       this.follow &&
       this.live &&
+      !this.tracerStalled &&
       this.lastSorted &&
       this.count > 0 &&
       !this.lastWindowCapped &&
@@ -1740,6 +1779,22 @@ export class Timeline {
           const e = Math.min(cw, x + w + 1);
           col[x] = (pref[e] - pref[a]) / (e - a);
         }
+      }
+    }
+
+    // Live CPU tail: in the pending area (right of the execution data edge) the
+    // histogram has no data yet, so plot the live on-CPU samples (head-fed),
+    // hold-interpolated — keeping the band moving at the live edge the way the lag
+    // band does, instead of dropping to a flat baseline over the arrival-lag gap.
+    const ncpu = this.cpuT.length;
+    if (ncpu > 0 && !isNaN(this.t0ns)) {
+      const edgeMs = this.fullSpanMs; // execution data edge in trace-ms
+      let si = 0;
+      let held = 0;
+      for (let x = 0; x < cw; x++) {
+        const t = this.viewT0 + x / this.pxPerMs;
+        while (si < ncpu && this.cpuT[si] <= t) held = this.cpuV[si++];
+        if (t > edgeMs) col[x] = held; // pending region → live sample
       }
     }
 

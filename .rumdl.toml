@@ -1,0 +1,15 @@
+# Markdown lint rules. Most defaults are kept; the disables below hand specific
+# concerns to other tools or reflect how the docs are written.
+[global]
+disable = [
+  "MD013", # line length — prettier owns wrapping
+  "MD033", # inline HTML — docs use raw HTML
+  "MD041", # first line need not be a top-level heading
+  "MD060", # table column alignment — prettier owns table formatting
+]
+
+# Allow repeated heading text under different parents (e.g. per-item
+# "Motivation"/"Steps"/"Notes" subsections in design docs); still flags true
+# duplicate sibling headings.
+[MD024]
+allow-different-nesting = true

@@ -2,8 +2,8 @@
   "name": "greenlane-linux",
   "build": { "dockerfile": "Dockerfile" },
 
-  // node is needed to run the prettier / markdownlint-cli2 binaries `bun install`
-  // drops into web/node_modules/.bin (their shebang is `node`).
+  // node is needed to run the prettier binary `bun install` drops into
+  // web/node_modules/.bin (its shebang is `node`).
   "features": {
     "ghcr.io/devcontainers/features/node:1": { "version": "22" }
   },

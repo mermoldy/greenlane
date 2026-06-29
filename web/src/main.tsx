@@ -75,8 +75,13 @@ type WsMsg =
       spanNs: number;
       totalExecutions: number;
       bytes: number;
+      // Tracer stalled: live session whose executions stopped advancing (the
+      // target's switch hook went quiet). The viewer stops chasing the live edge.
+      stalled?: boolean;
       retainedFromNs: number;
       lagMsPerSec: number | null;
+      // Live hub-thread on-CPU rate (ms/s); drives the CPU band's live tail.
+      cpuMsPerSec?: number | null;
     }
   | { type: "slowlog"; rows: SlowRow[]; total: number }
   | { type: "stats"; p50: number; p95: number; p99: number }
@@ -124,6 +129,8 @@ function App() {
   const tlRef = useRef<Timeline | null>(null);
   const [connected, setConnected] = useState(false);
   const [live, setLive] = useState(true); // session live (vs detached)
+  // Server-detected tracer stall: live session whose executions stopped advancing.
+  const [stalled, setStalled] = useState(false);
   const [tmode, setTmode] = useState<"relative" | "current" | "utc">(
     "relative",
   );
@@ -591,10 +598,15 @@ function App() {
             totalRef.current = msg.totalExecutions;
             tl?.setSpan(msg.spanNs);
             tl?.addLag(msg.spanNs, msg.lagMsPerSec); // R13: scheduler-lag band
+            tl?.addCpuSample(msg.spanNs, msg.cpuMsPerSec ?? null); // live CPU tail
             setEvictedFromNs(
               msg.retainedFromNs > originRef.current ? msg.retainedFromNs : 0,
             );
             if (tl) tl.retentionActive = msg.retainedFromNs > 0;
+            // Tracer-stall (server-detected): stop chasing the wall-clock edge and
+            // surface it. Auto-clears when executions resume.
+            if (tl) tl.tracerStalled = msg.stalled ?? false;
+            setStalled(msg.stalled ?? false);
             break;
           case "slowlog":
             setSlowRows(msg.rows);
@@ -661,20 +673,24 @@ function App() {
               ? "The viewer is not connected to the greenlane WebSocket."
               : source
                 ? "Viewing a saved .glr recording. The timeline is static."
-                : live
-                  ? "Connected to a live target process and still receiving events."
-                  : "Detached from the target. The trace is no longer collecting new events."
+                : live && stalled
+                  ? "Connected, but the target's greenlet switch tracing has gone quiet — no new executions are arriving. Check the target's stderr for a '[greenlane] trace hook error'."
+                  : live
+                    ? "Connected to a live target process and still receiving events."
+                    : "Detached from the target. The trace is no longer collecting new events."
           }
         >
           <span
-            className={`dot ${connected ? (source ? "file" : live ? "live" : "dead") : "dead"}`}
+            className={`dot ${connected ? (source ? "file" : live && !stalled ? "live" : "dead") : "dead"}`}
           />
           {!connected
             ? "disconnected"
             : source
               ? "recording"
               : live
-                ? "live"
+                ? stalled
+                  ? "stalled"
+                  : "live"
                 : "detached"}
         </span>
         {source && (
@@ -718,10 +734,20 @@ function App() {
         {live && (
           <span
             className="stat"
-            title="Arrival lag: how far the newest rendered execution trails real time (capture + transport delay). The live edge moves on the wall clock; executions fill in behind it."
-            style={lag > 1000 ? { color: "var(--ac-warn)" } : undefined}
+            title={
+              lag >= 5000
+                ? "⚠ Arrival lag is high: the newest rendered execution trails real time by several seconds — the viewer can't keep up with the capture+transport rate (try a narrower view, or check the connection)."
+                : "Arrival lag: how far the newest rendered execution trails real time (capture + transport delay). The live edge moves on the wall clock; executions fill in behind it."
+            }
+            style={
+              lag >= 5000
+                ? { color: "var(--ac-block)" } // red: seriously behind
+                : lag >= 1000
+                  ? { color: "var(--ac-warn)" } // amber: starting to trail
+                  : undefined // normal
+            }
           >
-            lag {formatTime(lag)}
+            {lag >= 5000 ? "⚠ " : ""}lag {formatTime(lag)}
           </span>
         )}
         {capped && (
@@ -1568,6 +1594,21 @@ function TracePanel({
   const frames = (h.stack ? h.stack.split(" <- ") : h.func ? [h.func] : []).map(
     parseFrame,
   );
+  // The raw trace exactly as captured (leaf → root, " <- "-joined
+  // "file.py:qualname:lineno" frames), for the copy button — falls back to the leaf
+  // `func` when no full stack was captured.
+  const rawTrace = h.stack || h.func || "";
+  const [copied, setCopied] = useState(false);
+  const copyTrace = () => {
+    if (!rawTrace) return;
+    navigator.clipboard
+      ?.writeText(rawTrace)
+      .then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1200);
+      })
+      .catch(() => {});
+  };
   // Whether THIS execution carries a full captured stack (vs only its cheap leaf
   // label). Stacks are gated per execution by the trace mode, so this is per-execution.
   const hasStack = !!h.stack;
@@ -1613,9 +1654,17 @@ function TracePanel({
         <div className="trace-title">
           <span>
             {hasStack
-              ? `call trace (${frames.length} frames · leaf → root)`
+              ? `call trace (${frames.length} frames)`
               : "leaf function only"}
           </span>
+          <button
+            className="ctl"
+            onClick={copyTrace}
+            disabled={!rawTrace}
+            title="Copy the full trace in its original captured format (file:qualname:line, leaf → root)"
+          >
+            {copied ? "Copied" : "Copy"}
+          </button>
           <label className="ctl open-in">
             open in
             <select value={editor} onChange={(e) => onEditor(e.target.value)}>

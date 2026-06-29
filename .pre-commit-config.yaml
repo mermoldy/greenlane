@@ -57,12 +57,6 @@ repos:
         language: system
         files: \.(css|html|json|md|tsx?|ya?ml)$
 
-      - id: markdownlint
-        name: markdownlint
-        entry: web/node_modules/.bin/markdownlint-cli2 --fix
-        language: system
-        types: [markdown]
-
       - id: typescript-typecheck
         name: TypeScript typecheck
         entry: bun run --cwd web typecheck
@@ -90,6 +84,14 @@ repos:
         language: system
         pass_filenames: false
         files: ^web/.*\.(ts|tsx)$
+
+  # Markdown lint + autofix. Zero-config: rumdl ships sensible defaults, so there
+  # is no project config file to maintain.
+  - repo: https://github.com/rvben/rumdl-pre-commit
+    rev: v0.2.26
+    hooks:
+      - id: rumdl
+        args: ["--fix"]
 
   - repo: https://github.com/lycheeverse/lychee
     rev: lychee-v0.21.0

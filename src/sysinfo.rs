@@ -104,6 +104,15 @@ impl SysInfo {
         let g = self.lag.lock().unwrap();
         g.as_ref()?.get("runqRateMsPerSec")?.as_f64()
     }
+
+    /// Latest hub-thread on-CPU rate ("ms on CPU per wall-second"; /1000 = utilization
+    /// fraction), or `None` when schedstat is unavailable. Tagged onto each live `head`
+    /// so the viewer can keep the CPU band's live tail moving in the pending area —
+    /// independent of the (lagging) execution stream, exactly like the lag band.
+    pub fn cpu_rate_ms_s(&self) -> Option<f64> {
+        let g = self.lag.lock().unwrap();
+        g.as_ref()?.get("onCpuRateMsPerSec")?.as_f64()
+    }
 }
 
 // ── one-shot host/process gathering ──────────────────────────────────────────
@@ -272,11 +281,17 @@ fn sample_loop(sys: Arc<SysInfo>, tid: u64, running: Arc<AtomicBool>) {
             continue;
         };
 
-        // Run-queue wait accrued since the last sample → a "ms of CPU starvation
-        // per wall-second" rate, plus the cumulative total.
-        let rate_ms_s = match prev {
-            Some((_, prev_runq)) => (runq.saturating_sub(prev_runq) as f64 / 1e6) / dt,
-            None => 0.0,
+        // Deltas since the last sample → rates in "ms per wall-second": run-queue
+        // wait (CPU starvation) and on-CPU time (utilization; /1000 = fraction). The
+        // on-CPU rate is a live, execution-stream-independent measure of the hub
+        // thread's CPU use — so the viewer can keep the CPU band moving in the
+        // pending area (ahead of the lagging trace data), the way lag already does.
+        let (rate_ms_s, cpu_ms_s) = match prev {
+            Some((prev_on, prev_runq)) => (
+                (runq.saturating_sub(prev_runq) as f64 / 1e6) / dt,
+                (on_cpu.saturating_sub(prev_on) as f64 / 1e6) / dt,
+            ),
+            None => (0.0, 0.0),
         };
         prev = Some((on_cpu, runq));
         prev_t = now;
@@ -286,6 +301,7 @@ fn sample_loop(sys: Arc<SysInfo>, tid: u64, running: Arc<AtomicBool>) {
             "runqWaitMs": runq as f64 / 1e6,
             "runqRateMsPerSec": rate_ms_s,
             "onCpuMs": on_cpu as f64 / 1e6,
+            "onCpuRateMsPerSec": cpu_ms_s,
         });
         if let Some(base) = &base {
             if let Some((periods, throttled, usec)) = read_throttle(base) {

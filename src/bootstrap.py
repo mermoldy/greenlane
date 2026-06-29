@@ -14,6 +14,7 @@ import gc
 import sys
 import threading
 import time
+from collections import deque
 
 try:
     import greenlet
@@ -183,11 +184,36 @@ def _greenlane_install():
     # in — so at the next switch we know how long it ran (whether it's "slow").
     _open_ts = [0]
 
+    # GC events enqueued by `_gc_cb` for the hub/trace thread to encode. `gc.callbacks`
+    # can fire on ANY thread that triggers a collection (e.g. gevent's threadpool), so
+    # `_gc_cb` must NOT touch the shared encoder/socket — doing so races `_cb` on the
+    # hub thread (and the GIL is released during `sendall`), which corrupts the stream
+    # (a half-written frame → the decoder's "undefined string id"). Instead it just
+    # appends a tuple here, and `_cb` drains + encodes them on the one trace thread, so
+    # all encoder/buffer access stays single-threaded. Bounded so a switch stall can't
+    # grow it without limit.
+    _gcq = deque(maxlen=8192)
+
+    def _drain_gc():
+        # Encode any queued GC events. MUST be called only from the hub/trace thread
+        # (from `_cb`/`_teardown`), never from `_gc_cb`.
+        while True:
+            try:
+                g = _gcq.popleft()
+            except IndexError:
+                return
+            enc.gc(g[0], g[1], g[2], g[3])
+
     def _teardown():
         # greenlane went away (exit / detach): remove ourselves so the target
         # stops paying the trace cost, and restore any prior hook. Best-effort
         # final flush first so a clean detach doesn't drop buffered events.
         try:
+            gc.callbacks.remove(_gc_cb)
+        except ValueError:
+            pass
+        try:
+            _drain_gc()
             _flush(time.perf_counter_ns() - t0)
         except Exception:
             pass
@@ -197,6 +223,10 @@ def _greenlane_install():
             pass
         greenlet.settrace(prev)
 
+    # One-shot guard so the first swallowed hot-path error is reported to the
+    # target's stderr (diagnosable) without spamming on every subsequent switch.
+    _warned = [False]
+
     def _cb(event, args):
         # event is "switch" or "throw" (a throw is also a context switch); args is
         # (origin, target): `origin` just yielded (its execution CLOSES now), `target` is
@@ -205,41 +235,67 @@ def _greenlane_install():
         # the collector attaches func to the opening execution and stack to the closing
         # one. Walking the closing greenlet's frame at close — only when needed —
         # is what makes `slow` cheap.
+        #
+        # CRITICAL: the entire body is wrapped so it can NEVER raise out of the
+        # callback. greenlet *disables* a trace hook that raises — which would
+        # silently kill all further switch capture (while GC + the server's head/lag
+        # keep flowing), the "streaming freezes after a while, lag climbs forever"
+        # failure. One bad event must skip itself, not tear down tracing for good.
         if event == "switch" or event == "throw":
-            origin, target = args
-            # A whitespace-free identity: type name + gevent's minimal_ident,
-            # e.g. "Hub", "Greenlet-3". The type prefix disambiguates the hub
-            # (which dominates running time while blocked in the event loop)
-            # from worker greenlets that may share a minimal_ident value.
-            name = type(target).__name__
-            mid = getattr(target, "minimal_ident", None)
-            label = name if mid is None else "%s-%s" % (name, mid)
-            ts = _perf() - t0
-            # Stack for the CLOSING greenlet (origin). Walk its yield point only
-            # when the mode asks and (for `slow`) the execution was actually slow and not
-            # the Hub — so the expensive walk happens for the executions worth it.
-            stack_frames = ()
-            if _GH_MODE == 2:  # all
-                stack_frames = _walk_greenlet(origin)
-            elif _GH_MODE == 1:  # slow
-                dur = ts - _open_ts[0]
-                if dur >= _GH_WARN_NS and not _is_hub(origin):
+            try:
+                # Encode any GC events queued by _gc_cb (possibly from other threads)
+                # here, on the single trace thread, before this switch — keeps all
+                # encoder access single-threaded (see `_gcq`).
+                if _gcq:
+                    _drain_gc()
+                origin, target = args
+                # A whitespace-free identity: type name + gevent's minimal_ident,
+                # e.g. "Hub", "Greenlet-3". The type prefix disambiguates the hub
+                # (which dominates running time while blocked in the event loop)
+                # from worker greenlets that may share a minimal_ident value.
+                name = type(target).__name__
+                mid = getattr(target, "minimal_ident", None)
+                label = name if mid is None else "%s-%s" % (name, mid)
+                ts = _perf() - t0
+                # Stack for the CLOSING greenlet (origin). Walk its yield point only
+                # when the mode asks and (for `slow`) the execution was actually slow and not
+                # the Hub — so the expensive walk happens for the executions worth it.
+                stack_frames = ()
+                if _GH_MODE == 2:  # all
                     stack_frames = _walk_greenlet(origin)
-            _open_ts[0] = ts
-            # Intern strings/stack (emits pool frames on first sight), then the
-            # switch event referencing their ids + the OS thread id.
-            enc.switch(
-                ts,
-                id(target),
-                enc.str_id(label),
-                enc.str_id(_headline_cheap()),  # cheap resume leaf for the opener
-                enc.str_id(_task_id(target)),
-                enc.stack_id(stack_frames),  # yield-point stack of the closer
-                _tid,
-            )
-            if (len(_buf) >= _FLUSH_BYTES or ts - _last_flush[0] >= _FLUSH_NS) and not _flush(ts):
-                _teardown()
-                return prev(event, args) if prev is not None else None
+                elif _GH_MODE == 1:  # slow
+                    dur = ts - _open_ts[0]
+                    if dur >= _GH_WARN_NS and not _is_hub(origin):
+                        stack_frames = _walk_greenlet(origin)
+                _open_ts[0] = ts
+                # Intern strings/stack (emits pool frames on first sight), then the
+                # switch event referencing their ids + the OS thread id.
+                enc.switch(
+                    ts,
+                    id(target),
+                    enc.str_id(label),
+                    enc.str_id(_headline_cheap()),  # cheap resume leaf for the opener
+                    enc.str_id(_task_id(target)),
+                    enc.stack_id(stack_frames),  # yield-point stack of the closer
+                    _tid,
+                )
+                if (len(_buf) >= _FLUSH_BYTES or ts - _last_flush[0] >= _FLUSH_NS) and not _flush(
+                    ts
+                ):
+                    _teardown()
+                    return prev(event, args) if prev is not None else None
+            except Exception:
+                # Skip this one event; stay installed. Report the first error to the
+                # target's stderr so a real bug surfaces instead of a silent freeze.
+                if not _warned[0]:
+                    _warned[0] = True
+                    try:
+                        import traceback
+
+                        sys.stderr.write("[greenlane] trace hook error (continuing):\n")
+                        traceback.print_exc()
+                    except Exception:
+                        pass
         # be polite: chain to any pre-existing tracer
         if prev is not None:
             try:
@@ -251,28 +307,25 @@ def _greenlane_install():
 
     # ── GC tracking ─────────────────────────────────────────────────────────
     # A GC pause blocks the whole gevent thread (every greenlet), so timing each
-    # collection explains timeline-wide stalls. gc.callbacks fires start/stop.
-    # (Assumes the single-hub-thread model: the encoder is shared with _cb without
-    # a lock, as the trace hook and GC run on the same thread under the GIL.)
+    # collection explains timeline-wide stalls. gc.callbacks fires start/stop — and
+    # may fire on ANY thread that triggers a collection. So this callback ONLY
+    # timestamps + enqueues (see `_gcq`); the actual encoding happens on the hub/trace
+    # thread in `_cb`/`_teardown`, keeping all encoder/socket access single-threaded.
+    # (Touching the shared encoder here would race `_cb` and corrupt the wire stream.)
     _gc_start = [0]
 
     def _gc_cb(phase, info):
         if phase == "start":
             _gc_start[0] = time.perf_counter_ns()
-        elif phase == "stop":
-            if _gc_start[0] == 0:
-                return  # "stop" without a matching "start" (installed mid-collection)
+        elif phase == "stop" and _gc_start[0]:
             now = time.perf_counter_ns()
             start = _gc_start[0] - t0
             if start < 0:
                 start = 0
-            enc.gc(start, now - _gc_start[0], info.get("generation", -1), info.get("collected", 0))
-            # GC is rare and marks a stall worth delivering promptly.
-            if not _flush(now - t0):
-                try:
-                    gc.callbacks.remove(_gc_cb)  # greenlane gone: stop tracking
-                except ValueError:
-                    pass
+            # Enqueue only — no encoder/socket access (drained + encoded by _cb).
+            _gcq.append(
+                (start, now - _gc_start[0], info.get("generation", -1), info.get("collected", 0))
+            )
 
     gc.callbacks.append(_gc_cb)
 

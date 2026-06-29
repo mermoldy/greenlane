@@ -43,6 +43,57 @@ use crate::sysinfo::SysInfo;
 /// header). Recordings are static and get none.
 const HEAD_TICK: Duration = Duration::from_millis(100);
 
+/// How often the live-attach stats monitor logs throughput and re-evaluates whether
+/// the tracer has stalled. One interval with zero new executions (while live) marks
+/// the tracer stalled.
+const STATS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Periodic stream-stats + tracer-stall monitor for a live attach. Logs per-interval
+/// throughput (executions/s, bytes/s) and flips `tracer_stalled` when the session is
+/// live but executions stopped advancing — i.e. the target's greenlet switch hook
+/// went quiet even though the stream (e.g. GC frames) may still be flowing. Clears the
+/// moment executions resume. Recordings don't run this (they're static).
+fn spawn_stats_monitor(db: Db, detached: Arc<AtomicBool>, tracer_stalled: Arc<AtomicBool>) {
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval(STATS_INTERVAL);
+        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let dt = STATS_INTERVAL.as_secs_f64();
+        let (mut prev_total, mut prev_bytes) = (db.total(), db.bytes());
+        loop {
+            iv.tick().await;
+            let (total, bytes) = (db.total(), db.bytes());
+            let live = !detached.load(Ordering::SeqCst);
+            let new_execs = total.saturating_sub(prev_total);
+            let new_bytes = bytes.saturating_sub(prev_bytes);
+            // Live + some data captured + nothing new this interval → the switch hook
+            // has gone quiet (a still-flowing byte count means the stream is otherwise
+            // alive, the classic silent stall; zero bytes means fully quiet).
+            let stalled = live && total > 0 && new_execs == 0;
+            let was = tracer_stalled.swap(stalled, Ordering::SeqCst);
+            if stalled && !was {
+                tracing::warn!(
+                    executions = total,
+                    stream_alive = new_bytes > 0,
+                    "tracer stalled — no new executions; greenlet switch hook may have stopped"
+                );
+            } else if !stalled && was {
+                tracing::info!(executions = total, "tracer resumed");
+            }
+            tracing::info!(
+                executions = total,
+                new_executions = new_execs,
+                exec_per_s = (new_execs as f64 / dt).round() as u64,
+                bytes,
+                kib_per_s = (new_bytes as f64 / dt / 1024.0).round() as u64,
+                live,
+                stalled,
+                "stream stats"
+            );
+            (prev_total, prev_bytes) = (total, bytes);
+        }
+    });
+}
+
 /// Hard cap on executions returned per viewport window (memory bound).
 const WINDOW_CAP: usize = 200_000;
 
@@ -72,6 +123,10 @@ struct AppState {
     trace_mode: Option<&'static str>,
     /// Host/process/runtime introspection + scheduler-lag (live attaches only).
     sys: Option<Arc<SysInfo>>,
+    /// Set by the stats monitor when the session is live but executions have stopped
+    /// advancing (the target's switch hook went quiet while the stream is otherwise
+    /// alive). Surfaced in `head` + `/healthz` so the viewer stops chasing the edge.
+    tracer_stalled: Arc<AtomicBool>,
     /// Warn/block execution-duration thresholds (slow-log filter + sent to the viewer).
     thresholds: Thresholds,
     /// Per-session secret required to reach `/ws`, `/info`, `/detach`. Supplied via
@@ -145,6 +200,13 @@ pub async fn serve(
     // (cross-origin → no same-origin cookie) can't use it.
     let auth_enabled = web_dir.is_none() && !no_auth;
     let token: Arc<str> = Arc::from(random_token());
+    let tracer_stalled = Arc::new(AtomicBool::new(false));
+    // Live attaches (no recording source) get a periodic stats monitor: it logs
+    // stream throughput and flips `tracer_stalled` when executions stop advancing
+    // while the session is live (the target's switch hook went quiet).
+    if source.is_none() {
+        spawn_stats_monitor(db.clone(), detached.clone(), tracer_stalled.clone());
+    }
     let state = AppState {
         db,
         pid,
@@ -152,6 +214,7 @@ pub async fn serve(
         source,
         trace_mode,
         sys,
+        tracer_stalled,
         thresholds,
         token: token.clone(),
         auth_enabled,
@@ -159,6 +222,7 @@ pub async fn serve(
     let mut app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/info", get(info_handler))
+        .route("/healthz", get(health_handler))
         .route("/detach", post(detach_handler));
 
     app = match &web_dir {
@@ -309,6 +373,25 @@ fn mime_for(path: &str) -> &'static str {
     }
 }
 
+/// GET /healthz — unauthenticated liveness + tracing status for health checks /
+/// quick triage. Exposes only counters (no timeline data), so it stays open for k8s
+/// probes. `tracerStalled` flags a live session whose executions stopped advancing.
+async fn health_handler(State(st): State<AppState>) -> Response {
+    let live = !st.detached.load(Ordering::SeqCst);
+    let stalled = st.tracer_stalled.load(Ordering::SeqCst);
+    let body = serde_json::json!({
+        "status": if live && stalled { "stalled" } else { "ok" },
+        "pid": st.pid,
+        "live": live,
+        "tracerStalled": stalled,
+        "executions": st.db.total(),
+        "bytes": st.db.bytes(),
+        "spanNs": st.db.span(),
+        "recording": st.source.is_some(),
+    });
+    axum::Json(body).into_response()
+}
+
 /// POST /detach — stop collecting so the target removes its trace hook.
 async fn detach_handler(
     State(st): State<AppState>,
@@ -407,6 +490,7 @@ async fn client(mut socket: WebSocket, st: AppState) {
 
     let mut was_detached = st.detached.load(Ordering::SeqCst);
     let mut last_head = (0u64, 0u64, 0u64); // (span, total, bytes) last pushed
+    let mut last_stalled = false; // last `stalled` flag pushed in a head
     let mut tick = tokio::time::interval(HEAD_TICK);
 
     loop {
@@ -441,19 +525,31 @@ async fn client(mut socket: WebSocket, st: AppState) {
                 // Skip the push when nothing changed since last tick (idle target).
                 if !st.detached.load(Ordering::SeqCst) {
                     let now = (st.db.span(), st.db.total(), st.db.bytes());
-                    if now != last_head {
+                    let stalled = st.tracer_stalled.load(Ordering::SeqCst);
+                    // Push when the counters moved OR the stall flag flipped — so the
+                    // viewer learns of a stall even if the stream went fully quiet
+                    // (counters frozen) and would otherwise get no head.
+                    if now != last_head || stalled != last_stalled {
                         last_head = now;
+                        last_stalled = stalled;
                         let head = serde_json::json!({
                             "type": "head",
                             "spanNs": now.0,
                             "totalExecutions": now.1,
                             "bytes": now.2,
+                            // Tracer stalled: live but executions stopped advancing — the
+                            // viewer uses this to stop chasing the wall-clock edge.
+                            "stalled": stalled,
                             // Retention horizon advances as old rows evict (live cap).
                             "retainedFromNs": st.db.retained_from(),
                             // R13: current hub-thread scheduler-lag rate (ms/s), or null
                             // where unsupported. The viewer plots it at the live edge
                             // (spanNs), so it aligns to the trace axis with no clock map.
                             "lagMsPerSec": st.sys.as_ref().and_then(|s| s.lag_rate_ms_s()),
+                            // Hub-thread on-CPU rate (ms/s; /1000 = utilization). Lets
+                            // the viewer keep the CPU band's live tail moving in the
+                            // pending area, the same way it does for lag.
+                            "cpuMsPerSec": st.sys.as_ref().and_then(|s| s.cpu_rate_ms_s()),
                         });
                         if send_json(&mut socket, &head).await.is_err() {
                             break;
@@ -836,6 +932,7 @@ mod tests {
             source: None,
             trace_mode: Some("all"),
             sys: None,
+            tracer_stalled: Arc::new(AtomicBool::new(false)),
             thresholds: Thresholds {
                 warn_ns: 20_000_000,
                 block_ns: 50_000_000,
