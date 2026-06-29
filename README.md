@@ -6,17 +6,14 @@
 ![viewer](https://img.shields.io/badge/viewer-WebGL2-8A2BE2)
 ![slop](https://img.shields.io/badge/slop-100%25-brightgreen)
 
-greenlane is a microscope for **gevent** applications. It attaches to a running
+greenlane is a timeline profiler for gevent applications. It attaches to a running
 Python process and records scheduler activity — every greenlet switch, plus GC
-pauses — then lays it out on a fast, zoomable web timeline. By combining the
-gevent hub scheduler, the garbage collector, and your own call stacks in one view,
-"what is my app actually doing?" becomes something you can see: which greenlet
-ran when, what it was doing, and where the hub stalls.
+pauses — then renders it on a zoomable web timeline. It shows the gevent hub
+scheduler, the garbage collector, and your own call stacks in one view: which
+greenlet ran when, what it was doing, and where the hub stalls.
 
-It uses `greenlet.settrace` to observe every cooperative switch on the gevent hub
-thread. It is a single self-contained binary: the web viewer is baked in, and the
-only thing that ever touches your process is a small bootstrap greenlane injects
-at attach time and removes again when you detach.
+It uses [greenlet.settrace](https://greenlet.readthedocs.io/en/latest/api.html#greenlet.settrace) to observe every cooperative switch on the gevent hub
+thread.
 
 ## Install
 
@@ -40,9 +37,6 @@ tar -xzf "$ARTIFACT"
 sudo install -m 755 "${ARTIFACT%.tar.gz}/greenlane" /usr/local/bin/greenlane
 ```
 
-Every release also publishes a combined `SHA256SUMS` file if you prefer to verify
-all artifacts at once.
-
 Then check it runs:
 
 ```sh
@@ -50,12 +44,12 @@ greenlane --help
 ```
 
 The viewer is embedded in the binary, so that's the whole install. The
-**target** process you attach to must be running **CPython 3.14+** (see
+target process you attach to must be running **CPython 3.14+** (see
 [Attaching & permissions](#attaching--permissions)).
 
 ### Build from source
 
-Prefer to build it yourself? You need **Rust** (edition 2024) and **bun**:
+To build it yourself, you need Rust (edition 2024) and bun:
 
 ```sh
 git clone https://github.com/mermoldy/greenlane
@@ -72,7 +66,7 @@ Attach to a running process by PID and watch it live in your browser:
 greenlane attach <PID> --serve        # serves at http://127.0.0.1:8080
 ```
 
-greenlane prints a **capability URL** with a one-time session token, like
+greenlane prints a capability URL with a one-time session token, like
 `http://127.0.0.1:8080/?token=…`. Open that exact URL — it authorizes the viewer
 (opening the bare address returns a 403). You'll see the timeline filling in live.
 Press `Ctrl-C` to stop; the detach button in the viewer removes the hook and
@@ -93,7 +87,7 @@ pgrep -fl python
 > remote host still prefer binding to `127.0.0.1` and reaching it over an SSH
 > tunnel.
 
-## Record now, replay later
+## Record and replay
 
 Omit `--serve` and greenlane records the session to a `.glr` file instead of
 serving it. Open that file any time to explore the exact same timeline in the
@@ -104,8 +98,8 @@ greenlane attach <PID>                # records to greenlane-<PID>.glr
 greenlane open greenlane-<PID>.glr    # replays it at http://127.0.0.1:8080
 ```
 
-Want both at once? Pass `--serve` to watch live _and_ `--out <path>` to also save
-the session to disk on exit:
+To do both, pass `--serve` to watch live _and_ `--out <path>` to also save the
+session to disk on exit:
 
 ```sh
 greenlane attach <PID> --serve --out session.glr
@@ -142,9 +136,7 @@ over the _whole_ capture (not just what's on screen), so its badge is the true
 count; filter it by tier, sort by time or duration, and click a row to jump the
 timeline straight to that execution.
 
-Click any execution to open its detail panel. To see the **full call stack** (leaf →
-root) behind a execution — each frame clickable to open at `file:line` in your editor
-— pick a trace mode:
+Click any execution to open its detail panel.:
 
 ```sh
 greenlane attach <PID> --serve                 # slow (default): stacks for slow executions
@@ -174,8 +166,8 @@ How greenlane works under the hood — the injection handshake, the event
 pipeline, the lossless streaming model, the full viewer tour, and known
 limitations — is documented in **[docs/architecture.md](docs/architecture.md)**.
 
-Want a target to attach to? The demo load generator (`bench/app.py`) and how to
-run the automated checks are covered in **[docs/testing.md](docs/testing.md)**.
+If you need a target to attach to, the demo load generator (`bench/app.py`) and
+how to run the automated checks are covered in **[docs/testing.md](docs/testing.md)**.
 
 Useful flags:
 
