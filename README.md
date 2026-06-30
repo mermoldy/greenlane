@@ -1,6 +1,6 @@
 # greenlane
 
-![version](https://img.shields.io/badge/version-0.1.0-blue)
+![version](https://img.shields.io/github/v/release/mermoldy/greenlane?label=version&color=blue)
 ![rust](https://img.shields.io/badge/rust-2024-orange)
 ![python](https://img.shields.io/badge/python-3.14%2B-3776AB)
 ![viewer](https://img.shields.io/badge/viewer-WebGL2-8A2BE2)
@@ -19,9 +19,36 @@ https://github.com/user-attachments/assets/cbf043cb-cedd-409b-99cb-1ed431a04c0e
 
 ## Install
 
-Grab the tarball for your platform from the
-[latest release](https://github.com/mermoldy/greenlane/releases/latest), verify
-its checksum, and drop the binary on your `PATH`:
+The install script detects your platform, downloads the matching release,
+verifies its checksum, and drops the binary on your `PATH`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mermoldy/greenlane/main/install.sh | sh
+```
+
+It installs to `/usr/local/bin` (using `sudo` only if that isn't writable). Set
+`BIN_DIR` to install elsewhere, or `VERSION` to pin a specific release tag:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mermoldy/greenlane/main/install.sh \
+  | BIN_DIR="$HOME/.local/bin" VERSION=v0.1.0 sh
+```
+
+Then check it runs:
+
+```sh
+greenlane --help
+```
+
+The viewer is embedded in the binary, so that's the whole install. The
+target process you attach to must be running **CPython 3.14+** (see
+[Attaching & permissions](#attaching--permissions)).
+
+### Manual install
+
+Prefer to verify each step yourself? Grab the tarball for your platform from the
+[latest release](https://github.com/mermoldy/greenlane/releases/latest), check
+its checksum, and install the binary:
 
 ```sh
 # Pick the artifact for your platform:
@@ -38,16 +65,6 @@ shasum -a 256 -c "$ARTIFACT.sha256"          # verify; on Linux use: sha256sum -
 tar -xzf "$ARTIFACT"
 sudo install -m 755 "${ARTIFACT%.tar.gz}/greenlane" /usr/local/bin/greenlane
 ```
-
-Then check it runs:
-
-```sh
-greenlane --help
-```
-
-The viewer is embedded in the binary, so that's the whole install. The
-target process you attach to must be running **CPython 3.14+** (see
-[Attaching & permissions](#attaching--permissions)).
 
 ### Build from source
 
