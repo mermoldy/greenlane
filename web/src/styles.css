@@ -5,21 +5,21 @@
   color-scheme: dark;
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
 
-  /* surfaces */
-  --bg-app: #0d0f13; /* body / track background */
-  --bg-panel: #14161b; /* bars and side/bottom panels */
-  --bg-float: #1c1f26; /* floating popups (help, system) */
-  --bg-tooltip: #21252e;
-  --bg-inset: #0f1115; /* recessed: segmented switch, code blocks */
-  --bg-hover: #1c2029; /* row / ghost-button hover */
-  --bg-trace-off: #1a1d24; /* trace-off notice panel */
+  /* surfaces — GitHub-Dark-aligned blue-black, a touch darker than GitHub default */
+  --bg-app: #0a0c10; /* body / track background */
+  --bg-panel: #0e1117; /* bars and side/bottom panels */
+  --bg-float: #161a21; /* floating popups (help, system) */
+  --bg-tooltip: #1b2029;
+  --bg-inset: #060809; /* recessed: segmented switch, code blocks */
+  --bg-hover: #161b22; /* row / ghost-button hover */
+  --bg-trace-off: #14181e; /* trace-off notice panel */
 
   /* borders (also used as control fills on this dark theme) */
-  --bd-soft: #23262e; /* bar dividers */
-  --bd: #2a2e38; /* default control fill + subtle border */
-  --bd-strong: #3b4252; /* control outline */
-  --bd-row: #1b1e25; /* list-row separators */
-  --bd-sel: #4c566a; /* selected/active fill */
+  --bd-soft: #1b2027; /* bar dividers */
+  --bd: #242a33; /* default control fill + subtle border */
+  --bd-strong: #30363d; /* control outline */
+  --bd-row: #161a20; /* list-row separators */
+  --bd-sel: #3a434f; /* selected/active fill */
 
   /* text */
   --tx: #d8dee9; /* primary */
@@ -851,7 +851,7 @@ canvas.overlay {
   white-space: nowrap;
   overflow: hidden;
   font-size: 11px;
-  background: rgba(13, 15, 19, 0.78);
+  background: rgba(10, 12, 16, 0.78);
 }
 .tracklabel .dot2 {
   width: 8px;

@@ -332,7 +332,7 @@ export class Timeline {
   // 2D-overlay colors, read once from the CSS custom-property tokens (:root in
   // styles.css) by loadTheme(), so the canvas and DOM chrome share one palette.
   // Defaults match the tokens in case they can't be resolved.
-  private tBg = "#0d0f13"; // --bg-app (band/track background)
+  private tBg = "#0a0c10"; // --bg-app (band/track background)
   private tMuted = "#8b93a3"; // --tx-muted (band labels)
   private tText2 = "#cdd3de"; // --tx-2 (help "?" text)
   private tLong = "#ebcb8b"; // --ac-long
