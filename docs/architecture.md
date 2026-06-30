@@ -175,8 +175,8 @@ even hours into a capture — an absolute-offset f32 would lose it. There is no
 server-side level-of-detail yet, so the browser holds the visible window plus a
 margin; that is comfortable for typical sessions but a multi-hour capture would
 want viewport-scoped aggregation. Finally, the viewer is served over plain HTTP:
-a per-session token (the capability URL greenlane prints) gates `/ws`, `/info`,
-and `/detach`, but the traffic isn't encrypted — for a remote host bind to
+a per-session token (the capability URL greenlane prints) gates `/ws` and
+`/detach`, but the traffic isn't encrypted — for a remote host bind to
 `127.0.0.1` and reach it through an SSH tunnel rather than exposing it directly.
 
 ## Attaching — full requirements & troubleshooting

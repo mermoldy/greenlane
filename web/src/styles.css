@@ -215,17 +215,8 @@ body {
 .topbar .stat.file .rprow:first-of-type {
   padding-top: 6px;
 }
-/* The path shares the row with its label and only wraps when it's too long. */
-.topbar .stat.file .rprow.path .rpv {
-  text-align: left;
-  min-width: 0;
-  /* Wrap only when the path is genuinely too long for the wide box, rather than
-     forcing mid-word breaks like the base `.rpv` (`word-break: break-all`). */
-  word-break: normal;
-  overflow-wrap: anywhere;
-}
 .topbar .stat.file .rpk {
-  flex: 0 0 auto;
+  flex: 0 0 44px;
   color: var(--tx-muted);
   text-transform: uppercase;
   font-size: 10px;
@@ -233,10 +224,13 @@ body {
 }
 .topbar .stat.file .rpv {
   flex: 1 1 auto;
-  text-align: right;
+  min-width: 0;
+  text-align: left;
   font-family: ui-monospace, Menlo, monospace;
   color: var(--tx);
-  word-break: break-all;
+  /* Wrap only when the path is genuinely too long for the box. */
+  word-break: normal;
+  overflow-wrap: anywhere;
 }
 .topbar .stat.file .rpnote {
   padding: 6px 12px 0;

@@ -101,7 +101,7 @@ pgrep -fl python
 > `--serve` accepts a bare port (`--serve 9000`), a `:port`, or a full
 > `host:port`. Use `--serve 0.0.0.0:8080` to expose it on the network. greenlane
 > prints a capability URL with a per-session token (`http://…/?token=…`) and gates
-> `/ws`, `/info`, and `/detach` on it — open the printed URL, and only holders of
+> `/ws` and `/detach` on it — open the printed URL, and only holders of
 > the token can read the timeline or detach. It's plain HTTP, though, so for a
 > remote host still prefer binding to `127.0.0.1` and reaching it over an SSH
 > tunnel.
