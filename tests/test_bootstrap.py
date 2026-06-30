@@ -1,6 +1,6 @@
 """Materialize-and-compile tests for the injection template ``src/bootstrap.py``.
 
-``bootstrap.py`` is not a standalone module: ``__TRACE_MODE__`` / ``__WARN_NS__`` /
+``bootstrap.py`` is not a standalone module: ``__TRACE_MODE__`` / ``__LONG_NS__`` /
 ``__SOCKET_PATH__`` are text-substituted and the ``# __GLR_ENCODER__`` marker is
 replaced by the contents of ``src/glr.py`` by the Rust materializer (``fill_template``
 in ``src/main.rs``) before injection. Importing the raw template fails, so we
@@ -18,7 +18,7 @@ import pytest
 _SRC = Path(__file__).resolve().parent.parent / "src"
 
 
-def _fill_template(trace_mode, warn_ns=1_000_000, sock_path="/tmp/greenlane-test/control.sock"):
+def _fill_template(trace_mode, long_ns=1_000_000, sock_path="/tmp/greenlane-test/control.sock"):
     """Port of ``fill_template`` (src/main.rs): inline glr.py at the encoder marker,
     then substitute the three runtime placeholders."""
     bootstrap = (_SRC / "bootstrap.py").read_text()
@@ -27,7 +27,7 @@ def _fill_template(trace_mode, warn_ns=1_000_000, sock_path="/tmp/greenlane-test
         bootstrap.replace("# __GLR_ENCODER__", encoder)
         .replace("__SOCKET_PATH__", sock_path)
         .replace("__TRACE_MODE__", str(trace_mode))
-        .replace("__WARN_NS__", str(warn_ns))
+        .replace("__LONG_NS__", str(long_ns))
     )
 
 
@@ -36,7 +36,7 @@ def test_materialized_bootstrap_compiles(trace_mode):
     filled = _fill_template(trace_mode)
     # No placeholders should survive substitution.
     assert "__TRACE_MODE__" not in filled
-    assert "__WARN_NS__" not in filled
+    assert "__LONG_NS__" not in filled
     assert "__SOCKET_PATH__" not in filled
     assert "# __GLR_ENCODER__" not in filled
     # The inlined encoder must be present so names like GlrEnc resolve.
