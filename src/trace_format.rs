@@ -45,7 +45,7 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 
-use crate::store::{Execution, GcEvent};
+use crate::store::{Execution, GcEvent, SysSample};
 
 // ── Wire constants (mirrored in the Python bootstraps) ──────────────────────
 
@@ -53,7 +53,9 @@ use crate::store::{Execution, GcEvent};
 /// `.glr` (which began with `b"GREENLNE"`).
 pub const MAGIC: [u8; 4] = *b"GLR\0";
 /// Format major version. Decoders reject unknown majors.
-pub const VERSION: u8 = 1;
+/// v2 adds the `syssample` event (scheduler-lag + CPU rates) so the lag/CPU bands
+/// are sourced from the stream/`.glr` rather than a live side channel.
+pub const VERSION: u8 = 2;
 
 // Frame tags.
 const T_SCHEMA: u8 = 0x01;
@@ -91,6 +93,9 @@ const MAX_FRAME_LEN: u64 = 64 << 20; // 64 MiB
 pub const TY_SWITCH: u16 = 1;
 pub const TY_GC: u16 = 2;
 pub const TY_EXECUTION: u16 = 3;
+/// Scheduler-lag + CPU sample (greenlane's `/proc` sampler). Appears in the wire
+/// stream and the `.glr` (v2+); decodes to [`SysSample`].
+pub const TY_SYSSAMPLE: u16 = 4;
 
 // ── Decoded items ────────────────────────────────────────────────────────────
 
@@ -122,6 +127,7 @@ pub enum Item {
     Switch(Switch),
     Execution(Execution),
     Gc(GcEvent),
+    Sample(SysSample),
 }
 
 // ── Varint / zigzag helpers ──────────────────────────────────────────────────
@@ -289,6 +295,12 @@ impl Val {
             _ => 0,
         }
     }
+    fn as_f(&self) -> f64 {
+        match self {
+            Val::F(v) => *v,
+            _ => 0.0,
+        }
+    }
     fn into_string(self) -> String {
         match self {
             Val::Str(s) | Val::Stack(s) => s,
@@ -347,9 +359,13 @@ impl Decoder {
             if buf[..4] != MAGIC {
                 bail!("not a greenlane binary trace (bad magic)");
             }
-            if buf[4] != VERSION {
+            // Accept any major up to ours: the framing is forward-compatible
+            // (unknown frame tags / event types are length-skipped), so a v1 stream
+            // — old `.glr` files and the live Python wire, which carry no
+            // `syssample` events — decodes cleanly under this v2 reader.
+            if buf[4] == 0 || buf[4] > VERSION {
                 bail!(
-                    "unsupported trace format version {} (this build reads v{})",
+                    "unsupported trace format version {} (this build reads up to v{})",
                     buf[4],
                     VERSION
                 );
@@ -556,6 +572,12 @@ impl Decoder {
                 generation: vals[2].as_i(),
                 collected: vals[3].as_i(),
             })),
+            // syssample (ts = sample time): lag, cpu (f64 ms/s)
+            TY_SYSSAMPLE if vals.len() >= 2 => Some(Item::Sample(SysSample {
+                start: ts,
+                lag_ms_s: vals[0].as_f(),
+                cpu_ms_s: vals[1].as_f(),
+            })),
             _ => None,
         }
     }
@@ -701,6 +723,12 @@ impl Encoder {
                 ("collected", FT_I64, UNIT_NONE),
             ],
         );
+        self.schema(
+            TY_SYSSAMPLE,
+            true,
+            "syssample",
+            &[("lag", FT_F64, UNIT_NONE), ("cpu", FT_F64, UNIT_NONE)],
+        );
     }
 
     pub fn meta(&mut self, epoch_ms: u64, tid: u64, pid: i64, pyinfo: &str) {
@@ -760,6 +788,21 @@ impl Encoder {
         write_varint(&mut body, g.dur);
         write_varint(&mut body, zigzag(g.generation));
         write_varint(&mut body, zigzag(g.collected));
+        self.frame(T_EVENT, &body);
+    }
+
+    /// Append a `syssample` event (ts = sample time; lag + cpu rates as f64 ms/s).
+    pub fn sample(&mut self, s: &SysSample) {
+        let delta = self.ts_delta(s.start);
+        let mut body = Vec::new();
+        body.extend_from_slice(&TY_SYSSAMPLE.to_le_bytes());
+        body.extend_from_slice(&[
+            (delta & 0xff) as u8,
+            ((delta >> 8) & 0xff) as u8,
+            ((delta >> 16) & 0xff) as u8,
+        ]);
+        body.extend_from_slice(&s.lag_ms_s.to_le_bytes());
+        body.extend_from_slice(&s.cpu_ms_s.to_le_bytes());
         self.frame(T_EVENT, &body);
     }
 
@@ -987,6 +1030,37 @@ mod tests {
             }
             _ => panic!("expected gc"),
         }
+    }
+
+    #[test]
+    fn syssample_roundtrips_through_glr_schemas() {
+        let mut enc = Encoder::new();
+        enc.write_file_schemas();
+        enc.sample(&SysSample {
+            start: 5_000,
+            lag_ms_s: 42.5,
+            cpu_ms_s: 810.25,
+        });
+        // A second sample, delta-encoded from the first's base.
+        enc.sample(&SysSample {
+            start: 5_100,
+            lag_ms_s: 0.0,
+            cpu_ms_s: 1000.0,
+        });
+        let items = decode_all(&enc.bytes().to_vec());
+        let got: Vec<&SysSample> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Sample(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].start, 5_000);
+        assert_eq!(got[0].lag_ms_s, 42.5);
+        assert_eq!(got[0].cpu_ms_s, 810.25);
+        assert_eq!(got[1].start, 5_100); // delta-decoded from base 5_000
+        assert_eq!(got[1].cpu_ms_s, 1000.0);
     }
 
     #[test]

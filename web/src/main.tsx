@@ -66,6 +66,9 @@ type WsMsg =
       traces: boolean | null;
       traceMode: "off" | "slow" | "all" | null;
       retainedFromNs: number;
+      // Host/process/runtime facts for the System panel (folded in from the old
+      // /info API); null for a recording with no captured system info.
+      system: Record<string, unknown> | null;
     }
   // Note: the viewport `window` reply is a BINARY columnar frame (see
   // decodeWindow), not a JSON message — so it isn't part of this union.
@@ -79,9 +82,6 @@ type WsMsg =
       // target's switch hook went quiet). The viewer stops chasing the live edge.
       stalled?: boolean;
       retainedFromNs: number;
-      lagMsPerSec: number | null;
-      // Live hub-thread on-CPU rate (ms/s); drives the CPU band's live tail.
-      cpuMsPerSec?: number | null;
     }
   | {
       type: "slowlog";
@@ -91,6 +91,9 @@ type WsMsg =
       blockedTotal: number;
     }
   | { type: "stats"; p50: number; p95: number; p99: number }
+  // Scheduler-lag + CPU samples for the visible window (the single source for the
+  // lag/CPU bands; 1:1 columns — ts in ns, lag/cpu in ms/s).
+  | { type: "samples"; ts: number[]; lag: number[]; cpu: number[] }
   // Lazy per-execution detail (the render-only window frame omits func/task/stack); the
   // viewer requests it on hover and matches the reply back by gid+startNs.
   | {
@@ -169,8 +172,8 @@ function App() {
   const lastReqMs = useRef(0); // perf-clock of the last viewport request (debug)
   const [drag, setDrag] = useState<"pan" | "zoom">("zoom");
   const [helpOpen, setHelpOpen] = useState(false);
-  // System panel: host/process/runtime details + live scheduler lag, fetched
-  // from /info while the panel is open.
+  // System panel: host/process/runtime details, delivered once in the `meta`
+  // message (folded in from the old /info API).
   const [sysOpen, setSysOpen] = useState(false);
   const [sysInfo, setSysInfo] = useState<Record<string, unknown> | null>(null);
   // Trace mode the capture used (--include-traces): "off" | "slow" | "all", or
@@ -273,6 +276,11 @@ function App() {
             ...(append ? { from: append.from, gcFrom: append.gcFrom } : {}),
           }),
         );
+        // The lag/CPU bands are sourced from the recorded `syssample` stream:
+        // request the samples covering this same window (the server pads one
+        // sample each side for clean edge interpolation). Tracks every window
+        // request, so it follows pan/zoom and the live edge alike.
+        ws.send(JSON.stringify({ type: "samples", t0, t1 }));
       }
     };
     setHeaderH(tl.headerHeight());
@@ -405,25 +413,9 @@ function App() {
   useEffect(() => fetchDetail(hover, setHover), [hover]);
   useEffect(() => fetchDetail(selected, setSelected), [selected]);
 
-  // While the System panel is open, poll /info (host/process/runtime facts +
-  // live scheduler-lag) once a second. Closed → no traffic.
-  useEffect(() => {
-    if (!sysOpen) return;
-    let stop = false;
-    const load = () =>
-      fetch("/info")
-        .then((r) => r.json())
-        .then((d) => {
-          if (!stop) setSysInfo(d);
-        })
-        .catch(() => {});
-    load();
-    const id = setInterval(load, 1000);
-    return () => {
-      stop = true;
-      clearInterval(id);
-    };
-  }, [sysOpen]);
+  // System-panel data (host/process/runtime) arrives once via the `meta` message
+  // (folded in from the old /info API), so there's no polling here — the `.glr`
+  // stream is the single source.
 
   useEffect(() => {
     let ws: WebSocket;
@@ -563,6 +555,7 @@ function App() {
             setLive(msg.live);
             setSource(msg.source);
             setTraceMode(msg.traceMode ?? null);
+            setSysInfo(msg.system ?? null); // System panel (folded in from /info)
             dataBytesRef.current = msg.bytes;
             totalRef.current = msg.totalExecutions;
             // Span-duration thresholds (configurable server-side): drive execution
@@ -607,8 +600,6 @@ function App() {
             dataBytesRef.current = msg.bytes;
             totalRef.current = msg.totalExecutions;
             tl?.setSpan(msg.spanNs);
-            tl?.addLag(msg.spanNs, msg.lagMsPerSec); // R13: scheduler-lag band
-            tl?.addCpuSample(msg.spanNs, msg.cpuMsPerSec ?? null); // live CPU tail
             setEvictedFromNs(
               msg.retainedFromNs > originRef.current ? msg.retainedFromNs : 0,
             );
@@ -624,6 +615,10 @@ function App() {
             setSlowLong(msg.longTotal);
             setSlowBlocked(msg.blockedTotal);
             setSlowLoading(false);
+            break;
+          case "samples":
+            // Single source for the lag/CPU bands (live + recordings).
+            tl?.setSamples(msg.ts, msg.lag, msg.cpu);
             break;
           case "detail": {
             // Lazy per-execution detail: cache it and merge into hover/selected if they
@@ -706,13 +701,22 @@ function App() {
                 : "detached"}
         </span>
         {source && (
-          <span
-            className="stat file"
-            title={`Recording file: ${source.file}. Size: ${formatBytes(source.bytes)}.`}
-          >
+          <span className="stat file" tabIndex={0}>
             <IconOpen />
-            <span className="nm">{source.file.split("/").pop()}</span>
-            <span>· {formatBytes(source.bytes)}</span>
+            <div className="recpop" role="tooltip">
+              <div className="rphead">recording</div>
+              <div className="rprow path">
+                <span className="rpk">file</span>
+                <span className="rpv">{source.file}</span>
+              </div>
+              <div className="rprow">
+                <span className="rpk">size</span>
+                <span className="rpv">{formatBytes(source.bytes)}</span>
+              </div>
+              <div className="rpnote">
+                Saved .glr recording — the timeline is static.
+              </div>
+            </div>
           </span>
         )}
         <span className="statchips">
@@ -825,7 +829,15 @@ function App() {
             className="danger"
             onClick={() => fetch("/detach", { method: "POST" }).catch(() => {})}
             disabled={!connected || !live}
-            title="Stop instrumenting the target process and leave the current timeline frozen."
+            title={
+              !connected
+                ? "Disconnected — nothing to detach from."
+                : source
+                  ? "Unavailable while viewing a saved recording — there's no live process to detach from."
+                  : !live
+                    ? "Already detached from the target process."
+                    : "Stop instrumenting the target process and leave the current timeline frozen."
+            }
           >
             <IconDetach /> detach
           </button>
@@ -837,9 +849,13 @@ function App() {
             title={
               !connected
                 ? "Disconnected — nothing to follow."
-                : follow
-                  ? "Following the live edge. Click to pause and hold the current viewport."
-                  : "Paused. Click to follow the live edge as new data arrives."
+                : source
+                  ? "Unavailable for a saved recording — the timeline is static, so there's no live edge to follow."
+                  : !live
+                    ? "Detached — no live edge to follow."
+                    : follow
+                      ? "Following the live edge. Click to pause and hold the current viewport."
+                      : "Paused. Click to follow the live edge as new data arrives."
             }
           >
             {follow ? (
@@ -1152,9 +1168,9 @@ function App() {
   );
 }
 
-// System panel: host / process / interpreter facts and live kernel scheduler
-// lag, polled from /info while open. Scheduler lag (run-queue wait + cgroup
-// throttling) is Linux-only and live-only; recordings show what they have.
+// System panel: host / process / interpreter facts, delivered once in the `meta`
+// message (a connect-time snapshot — no /info API). Scheduler lag itself is a
+// recorded sample stream now (the lag band), so it replays with the recording.
 function SysPanel({
   info,
   onClose,

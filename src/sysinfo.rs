@@ -25,10 +25,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::db::Db;
+use crate::store::SysSample;
+
 /// How often the sampler polls `/proc` for scheduler-lag deltas.
 const SAMPLE_EVERY: Duration = Duration::from_millis(100);
 
-/// Everything the `/info` endpoint serves. Cheaply clonable via `Arc`.
+/// Host/process/runtime facts for the System panel (sent to the viewer in the `meta` frame). Cheaply clonable via `Arc`.
 pub struct SysInfo {
     pid: i32,
     /// Host kernel + CPU + cgroup limit — gathered once at startup.
@@ -66,7 +69,9 @@ impl SysInfo {
     }
 
     /// Record the runtime thread id and, the first time, start the lag sampler.
-    pub fn set_tid(self: &Arc<Self>, tid: u64, running: Arc<AtomicBool>) {
+    /// The sampler ingests each scheduler-lag/CPU reading into `db` as a `SysSample`
+    /// so the lag/CPU bands are sourced from the recorded stream — no live side channel.
+    pub fn set_tid(self: &Arc<Self>, tid: u64, running: Arc<AtomicBool>, db: Db) {
         self.tid.store(tid, Ordering::Relaxed);
         if self
             .sampler_started
@@ -76,12 +81,12 @@ impl SysInfo {
             let this = self.clone();
             std::thread::Builder::new()
                 .name("greenlane-lag".into())
-                .spawn(move || sample_loop(this, tid, running))
+                .spawn(move || sample_loop(this, tid, running, db))
                 .ok();
         }
     }
 
-    /// The full `/info` document for the viewer's System panel.
+    /// The host/process/runtime snapshot the viewer.s System panel renders (folded into the `meta` frame; no `/info` API).
     pub fn to_json(&self, live: bool, source: Option<Value>) -> Value {
         json!({
             "pid": self.pid,
@@ -93,25 +98,6 @@ impl SysInfo {
             "python": *self.pyinfo.lock().unwrap(),
             "lag": *self.lag.lock().unwrap(),
         })
-    }
-
-    /// Latest hub-thread run-queue delay rate ("ms of CPU starvation per wall
-    /// second"), or `None` when schedstat is unavailable (non-Linux / no
-    /// CONFIG_SCHEDSTATS / not yet sampled). Drives R13's timeline lag band: the
-    /// server tags each live `head` with this, and the viewer plots it at the
-    /// current live edge — so it aligns to the trace axis with no clock mapping.
-    pub fn lag_rate_ms_s(&self) -> Option<f64> {
-        let g = self.lag.lock().unwrap();
-        g.as_ref()?.get("runqRateMsPerSec")?.as_f64()
-    }
-
-    /// Latest hub-thread on-CPU rate ("ms on CPU per wall-second"; /1000 = utilization
-    /// fraction), or `None` when schedstat is unavailable. Tagged onto each live `head`
-    /// so the viewer can keep the CPU band's live tail moving in the pending area —
-    /// independent of the (lagging) execution stream, exactly like the lag band.
-    pub fn cpu_rate_ms_s(&self) -> Option<f64> {
-        let g = self.lag.lock().unwrap();
-        g.as_ref()?.get("onCpuRateMsPerSec")?.as_f64()
     }
 }
 
@@ -263,7 +249,7 @@ fn read_psi_some_avg10(base: &str) -> Option<f64> {
 
 /// Poll `/proc` for this thread's run-queue delay (and cgroup throttling / PSI)
 /// until the session ends, updating the shared `lag` snapshot each tick.
-fn sample_loop(sys: Arc<SysInfo>, tid: u64, running: Arc<AtomicBool>) {
+fn sample_loop(sys: Arc<SysInfo>, tid: u64, running: Arc<AtomicBool>, db: Db) {
     let pid = sys.pid;
     let base = cgroup_base(pid);
     let mut prev = read_schedstat(pid, tid);
@@ -316,6 +302,15 @@ fn sample_loop(sys: Arc<SysInfo>, tid: u64, running: Arc<AtomicBool>) {
             }
         }
         *sys.lag.lock().unwrap() = Some(lag);
+
+        // Ingest the reading into the store as a `SysSample`, tagged at the current
+        // trace edge (the data frontier the bands plot against). This is the single
+        // source for the lag/CPU bands — recorded into the `.glr` and replayed.
+        db.ingest_sample(SysSample {
+            start: db.span(),
+            lag_ms_s: rate_ms_s,
+            cpu_ms_s,
+        });
 
         // Keep the process panel (RSS, threads, ctxt switches) fresh too.
         *sys.process.lock().unwrap() = gather_process(pid);

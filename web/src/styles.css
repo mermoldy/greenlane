@@ -171,12 +171,79 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  max-width: 22ch;
+  position: relative;
+  cursor: default;
 }
-.topbar .stat.file .nm {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+/* Recording details popover, revealed on hover/focus of the link icon. */
+.topbar .stat.file .recpop {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 40;
+  width: 560px;
+  max-width: calc(100vw - 24px);
+  background: var(--bg-float);
+  border: 1px solid var(--bd-strong);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  padding: 8px 0;
+  color: var(--tx);
+  /* The topbar sets `white-space: nowrap` on every `.stat`; reset it here or the
+     long file path can never wrap and spills past the popover edge. */
+  white-space: normal;
+  display: none;
+}
+.topbar .stat.file:hover .recpop,
+.topbar .stat.file:focus-within .recpop {
+  display: block;
+}
+.topbar .stat.file .rphead {
+  padding: 0 12px 6px;
+  border-bottom: 1px solid var(--bd);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--tx);
+}
+.topbar .stat.file .rprow {
+  display: flex;
+  gap: 16px;
+  padding: 2px 12px;
+  align-items: baseline;
+}
+.topbar .stat.file .rprow:first-of-type {
+  padding-top: 6px;
+}
+/* The path shares the row with its label and only wraps when it's too long. */
+.topbar .stat.file .rprow.path .rpv {
+  text-align: left;
+  min-width: 0;
+  /* Wrap only when the path is genuinely too long for the wide box, rather than
+     forcing mid-word breaks like the base `.rpv` (`word-break: break-all`). */
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+.topbar .stat.file .rpk {
+  flex: 0 0 auto;
+  color: var(--tx-muted);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+}
+.topbar .stat.file .rpv {
+  flex: 1 1 auto;
+  text-align: right;
+  font-family: ui-monospace, Menlo, monospace;
+  color: var(--tx);
+  word-break: break-all;
+}
+.topbar .stat.file .rpnote {
+  padding: 6px 12px 0;
+  margin-top: 4px;
+  border-top: 1px solid var(--bd-soft);
+  color: var(--tx-faint);
+  font-style: italic;
 }
 .topbar .dot {
   width: 8px;
@@ -229,20 +296,17 @@ body {
   font-variant-numeric: tabular-nums;
   display: inline-block;
 }
-.statchips .ch-exec .chip-v {
-  min-width: 152px;
-}
-.statchips .ch-buf .chip-v {
-  min-width: 112px;
-}
+/* EXEC/BUFFER change digit-count rarely (tabular-nums covers the byte jitter), so
+   they don't reserve width — that kept the header from fitting one line. Only the
+   frequently-updating chips reserve, to stop them shifting neighbours. */
 .statchips .ch-rate .chip-v {
-  min-width: 52px;
+  min-width: 48px;
 }
 .statchips .ch-gc .chip-v {
-  min-width: 56px;
+  min-width: 52px;
 }
 .statchips .ch-lag .chip-v {
-  min-width: 56px;
+  min-width: 50px;
 }
 .statchips .chip-u {
   color: var(--tx-faint);

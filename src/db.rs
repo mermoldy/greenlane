@@ -25,7 +25,7 @@ use serde::Serialize;
 use tokio::sync::oneshot;
 use tracing::{debug, error, trace};
 
-use crate::store::{Execution, GcEvent};
+use crate::store::{Execution, GcEvent, SysSample};
 
 /// Sentinel for "origin not yet observed".
 const ORIGIN_UNSET: u64 = u64::MAX;
@@ -78,6 +78,11 @@ pub enum Query {
     },
     /// Duration percentiles (non-Hub) over `[t0, t1]` (whole timeline if full range).
     Stats { t0: u64, t1: u64 },
+    /// Scheduler-lag + CPU samples whose timestamp falls in `[t0, t1]` ns, in time
+    /// order — drives the lag/CPU bands (live and from a recording, since samples
+    /// are part of the recorded stream). One extra sample on each side is included
+    /// so the bands hold-interpolate cleanly to the viewport edges.
+    Samples { t0: u64, t1: u64 },
     /// On-demand per-execution detail (func/task/stack) for one execution, looked up
     /// by greenlet and start. The window frame is render-only (start/dur/track) and
     /// no longer ships these, so the viewer fetches them lazily on hover/click.
@@ -216,6 +221,15 @@ pub enum Reply {
         p95: f64,
         p99: f64,
     },
+    /// Scheduler-lag + CPU samples in range, in time order (1:1 columns).
+    Samples {
+        /// Sample times in ns since the trace origin.
+        ts: Vec<u64>,
+        /// Run-queue-wait rate (ms/s) per sample.
+        lag: Vec<f64>,
+        /// On-CPU rate (ms/s) per sample.
+        cpu: Vec<f64>,
+    },
     /// Per-execution detail for one execution (empty strings if no row matched the lookup).
     Detail {
         func: String,
@@ -247,6 +261,7 @@ pub enum Reply {
 enum Cmd {
     Executions(Vec<Execution>),
     Gc(Vec<GcEvent>),
+    Sample(SysSample),
     Query(Query, oneshot::Sender<Result<Reply>>),
     /// Stream the whole timeline to a chunked `.glr`; replies with on-disk size.
     Flush {
@@ -338,6 +353,13 @@ impl Db {
         let _ = self.tx.send(Cmd::Gc(gc));
     }
 
+    /// Record one scheduler-lag + CPU sample (greenlane's `/proc` sampler). Flows
+    /// into the same store as executions/GC, so it's recorded into the `.glr` and
+    /// replayed uniformly — the lag/CPU bands have no separate live channel.
+    pub fn ingest_sample(&self, s: SysSample) {
+        let _ = self.tx.send(Cmd::Sample(s));
+    }
+
     /// Add to the raw event-stream byte counter (reported in the viewer header).
     pub fn add_bytes(&self, n: usize) {
         self.bytes.fetch_add(n as u64, Ordering::Relaxed);
@@ -408,6 +430,9 @@ impl Db {
 struct Timeline {
     df: Option<DataFrame>,
     gc: Vec<GcEvent>,
+    /// Scheduler-lag + CPU samples, in arrival (time) order. Sparse (~10/s), so a
+    /// plain Vec scanned by range is plenty; recorded/replayed like `gc`.
+    samples: Vec<SysSample>,
     /// `start` (ns) of every row in `df`, in row (ingest) order, 1:1 with rows.
     starts: Vec<i64>,
     /// True while `starts` is non-decreasing. A single cooperative runtime thread
@@ -463,6 +488,7 @@ fn db_thread(rx: Receiver<Cmd>, cap_rows: Option<usize>, retained_from: Arc<Atom
     let mut tl = Timeline {
         df: None,
         gc: Vec::new(),
+        samples: Vec::new(),
         starts: Vec::new(),
         sorted: true,
         max_end: i64::MIN,
@@ -478,6 +504,7 @@ fn db_thread(rx: Receiver<Cmd>, cap_rows: Option<usize>, retained_from: Arc<Atom
     let mut rec: Option<crate::record::SegmentWriter> = None;
     let mut rec_rows = 0usize; // executions already sealed
     let mut rec_gc = 0usize; // GC events already sealed
+    let mut rec_samples = 0usize; // sys samples already sealed
 
     loop {
         match rx.recv_timeout(FLUSH_IDLE) {
@@ -488,6 +515,7 @@ fn db_thread(rx: Receiver<Cmd>, cap_rows: Option<usize>, retained_from: Arc<Atom
                 }
             }
             Ok(Cmd::Gc(mut v)) => tl.gc.append(&mut v),
+            Ok(Cmd::Sample(s)) => tl.samples.push(s),
             Ok(Cmd::Query(q, reply)) => {
                 flush_pending(&mut tl, &mut pending);
                 match q {
@@ -527,6 +555,11 @@ fn db_thread(rx: Receiver<Cmd>, cap_rows: Option<usize>, retained_from: Arc<Atom
                     } => {
                         let _ = reply.send(detail(&tl, gid, start_ns, dur_ns));
                     }
+                    // Samples live on the timeline (not the DataFrame) and are sparse,
+                    // so run inline like Window — a cheap range scan over `tl.samples`.
+                    Query::Samples { t0, t1 } => {
+                        let _ = reply.send(samples(&tl, t0, t1));
+                    }
                     // Slowlog/Stats are O(total) Polars scans — run them OFF the
                     // ingest thread on a cheap (Arc) DataFrame snapshot, via the
                     // bounded pool so they don't stall ingestion or spawn unbounded
@@ -555,6 +588,7 @@ fn db_thread(rx: Receiver<Cmd>, cap_rows: Option<usize>, retained_from: Arc<Atom
                     &mut rec,
                     &mut rec_rows,
                     &mut rec_gc,
+                    &mut rec_samples,
                     &tl,
                     &path,
                     pid,
@@ -698,6 +732,7 @@ fn run_read(df: Option<&DataFrame>, q: Query) -> Result<Reply> {
         Query::Window { .. } => unreachable!("window runs inline on the DB thread"),
         Query::Tail { .. } => unreachable!("tail runs inline on the DB thread"),
         Query::Summary { .. } => unreachable!("summary runs inline on the DB thread"),
+        Query::Samples { .. } => unreachable!("samples runs inline on the DB thread"),
     }
 }
 
@@ -1197,6 +1232,33 @@ fn stats(df: Option<&DataFrame>, t0: u64, t1: u64) -> Result<Reply> {
     Ok(Reply::Stats { p50, p95, p99 })
 }
 
+/// Scheduler-lag + CPU samples with timestamp in `[t0, t1]`, in time order, plus
+/// the one sample just outside each edge so the bands hold-interpolate cleanly to
+/// the viewport. `tl.samples` is arrival- (time-)ordered and sparse, so a linear
+/// scan is plenty.
+fn samples(tl: &Timeline, t0: u64, t1: u64) -> Result<Reply> {
+    let all = &tl.samples;
+    let n = all.len();
+    let mut lo = 0;
+    while lo < n && all[lo].start < t0 {
+        lo += 1;
+    }
+    // Start one sample early (left-edge interpolation), if there is one.
+    let start_i = lo.saturating_sub(1);
+    let mut ts = Vec::new();
+    let mut lag = Vec::new();
+    let mut cpu = Vec::new();
+    for s in &all[start_i..] {
+        ts.push(s.start);
+        lag.push(s.lag_ms_s);
+        cpu.push(s.cpu_ms_s);
+        if s.start > t1 {
+            break; // included one past the right edge, now stop
+        }
+    }
+    Ok(Reply::Samples { ts, lag, cpu })
+}
+
 /// Whole-capture aggregates for `analyze`. Runs inline on the DB thread because it
 /// needs `tl.gc` (GC lives on the timeline, not the DataFrame) alongside the
 /// DataFrame scans for greenlet/function rollups.
@@ -1379,6 +1441,7 @@ fn seal_recording(
     rec: &mut Option<crate::record::SegmentWriter>,
     rec_rows: &mut usize,
     rec_gc: &mut usize,
+    rec_samples: &mut usize,
     tl: &Timeline,
     path: &Path,
     pid: i32,
@@ -1399,10 +1462,13 @@ fn seal_recording(
     };
     let glo = (*rec_gc).min(tl.gc.len());
     let new_gc = &tl.gc[glo..];
+    let slo = (*rec_samples).min(tl.samples.len());
+    let new_samples = &tl.samples[slo..];
 
-    writer.seal_segment(&new_executions, new_gc, pid, epoch_ms)?;
+    writer.seal_segment(&new_executions, new_gc, new_samples, pid, epoch_ms)?;
     *rec_rows = height;
     *rec_gc = tl.gc.len();
+    *rec_samples = tl.samples.len();
 
     let bytes = writer.size();
     debug!(

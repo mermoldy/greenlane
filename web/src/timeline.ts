@@ -1028,47 +1028,30 @@ export class Timeline {
     this.dirty = true; // edge / pending-region position changed
   }
 
-  /** Record a kernel scheduler-lag sample (R13) at the current live edge. `rate`
-   *  is run-queue-wait ms per wall-second, or null where unsupported (no sample
-   *  stored then). Called from each live `head`. */
-  addLag(spanNs: number, rate: number | null) {
-    if (rate == null || !isFinite(rate)) return;
+  /** Replace the scheduler-lag (R13) + CPU-tail series from a `samples` query reply
+   *  — the single source for both bands, live or from a recording (samples are part
+   *  of the recorded stream). `ts` are ns since the trace origin; `lag` is
+   *  run-queue-wait ms/s; `cpu` is on-CPU ms/s, stored as a [0,1] utilization
+   *  fraction. The reply already covers the visible window (+ one sample each side),
+   *  which is exactly what the bands hold-interpolate across. */
+  setSamples(ts: number[], lag: number[], cpu: number[]) {
     this.dirty = true;
-    const t = spanNs / 1e6;
-    // Coalesce duplicate edges (head can repeat the same execution) by overwriting.
-    const n = this.lagT.length;
-    if (n && t <= this.lagT[n - 1]) {
-      this.lagV[n - 1] = rate;
-      return;
+    const n = ts.length;
+    const lagT = new Array<number>(n);
+    const lagV = new Array<number>(n);
+    const cpuT = new Array<number>(n);
+    const cpuV = new Array<number>(n);
+    for (let i = 0; i < n; i++) {
+      const tMs = ts[i] / 1e6;
+      lagT[i] = tMs;
+      lagV[i] = lag[i];
+      cpuT[i] = tMs;
+      cpuV[i] = Math.max(0, Math.min(1, cpu[i] / 1000));
     }
-    this.lagT.push(t);
-    this.lagV.push(rate);
-    // Bounded ring: ~1 sample/100ms, so 36k ≈ 1h of history.
-    if (this.lagT.length > 36_000) {
-      this.lagT.shift();
-      this.lagV.shift();
-    }
-  }
-
-  /** Record a live hub-thread CPU sample at the current live edge. `cpuMsPerSec` is
-   *  on-CPU ms per wall-second (server `head`); stored as a [0,1] utilization fraction
-   *  and plotted as the CPU band's live tail in the pending area. null → no sample. */
-  addCpuSample(spanNs: number, cpuMsPerSec: number | null) {
-    if (cpuMsPerSec == null || !isFinite(cpuMsPerSec)) return;
-    this.dirty = true;
-    const t = spanNs / 1e6;
-    const frac = Math.max(0, Math.min(1, cpuMsPerSec / 1000));
-    const n = this.cpuT.length;
-    if (n && t <= this.cpuT[n - 1]) {
-      this.cpuV[n - 1] = frac; // coalesce duplicate edges
-      return;
-    }
-    this.cpuT.push(t);
-    this.cpuV.push(frac);
-    if (this.cpuT.length > 36_000) {
-      this.cpuT.shift();
-      this.cpuV.shift();
-    }
+    this.lagT = lagT;
+    this.lagV = lagV;
+    this.cpuT = cpuT;
+    this.cpuV = cpuV;
   }
 
   /** The live edge in trace-relative ms: "now" (wall clock) for a live session,

@@ -22,7 +22,7 @@ use anyhow::{Context, Result, bail};
 use tracing::warn;
 
 use crate::db::Db;
-use crate::store::{Execution, GcEvent};
+use crate::store::{Execution, GcEvent, SysSample};
 use crate::trace_format::{Decoder, Encoder, Item, Step};
 
 /// Executions buffered before an ingest batch when reading a file back.
@@ -123,20 +123,23 @@ impl SegmentWriter {
         &mut self,
         executions: &[Execution],
         gc: &[GcEvent],
+        samples: &[SysSample],
         pid: i32,
         epoch_ms: Option<u64>,
     ) -> Result<()> {
         let include_meta = !self.meta_done;
-        if !include_meta && executions.is_empty() && gc.is_empty() {
+        if !include_meta && executions.is_empty() && gc.is_empty() && samples.is_empty() {
             return Ok(());
         }
 
         let mut idx = 0;
         let mut wrote_first = false;
-        // Seal while executions remain — and at least once if there's meta/GC to record
-        // even with no executions.
-        while idx < executions.len() || (!wrote_first && (include_meta || !gc.is_empty())) {
-            // A self-contained trace stream: header + schemas (+ meta/GC on the
+        // Seal while executions remain — and at least once if there's meta/GC/samples to
+        // record even with no executions.
+        while idx < executions.len()
+            || (!wrote_first && (include_meta || !gc.is_empty() || !samples.is_empty()))
+        {
+            // A self-contained trace stream: header + schemas (+ meta/GC/samples on the
             // first sub-segment) + as many executions as fit under the soft size cap.
             let mut enc = Encoder::new();
             enc.write_file_schemas();
@@ -148,6 +151,9 @@ impl SegmentWriter {
                 }
                 for g in gc {
                     enc.gc(g);
+                }
+                for s in samples {
+                    enc.sample(s);
                 }
             }
             while idx < executions.len() {
@@ -200,6 +206,7 @@ struct Ingest<'a> {
     pid: i32,
     executions: Vec<Execution>,
     gc: Vec<GcEvent>,
+    samples: Vec<SysSample>,
 }
 
 impl<'a> Ingest<'a> {
@@ -209,6 +216,7 @@ impl<'a> Ingest<'a> {
             pid: 0,
             executions: Vec::with_capacity(CHUNK),
             gc: Vec::new(),
+            samples: Vec::new(),
         }
     }
 
@@ -228,6 +236,7 @@ impl<'a> Ingest<'a> {
                 }
             }
             Some(Item::Gc(g)) => self.gc.push(g),
+            Some(Item::Sample(s)) => self.samples.push(s),
             // `switch` is wire-only; a file shouldn't contain one — ignore if it does.
             Some(Item::Switch(_)) | None => {}
         }
@@ -240,6 +249,9 @@ impl<'a> Ingest<'a> {
         }
         if !self.gc.is_empty() {
             self.db.ingest_gc(std::mem::take(&mut self.gc));
+        }
+        for s in self.samples.drain(..) {
+            self.db.ingest_sample(s);
         }
         self.pid
     }

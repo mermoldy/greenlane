@@ -33,6 +33,14 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # The lychee pre-commit hook's installer grabs a prebuilt binary when
+      # cargo-binstall is present, and otherwise falls back to `cargo install
+      # lychee`, which compiles the latest release from source and currently
+      # fails to build its `cookie`/`time` deps. Providing cargo-binstall keeps
+      # the hook on the prebuilt path.
+      - name: Set up cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
       - name: Install Python dependencies
         run: uv sync --locked --dev
 

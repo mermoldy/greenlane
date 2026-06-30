@@ -9,10 +9,13 @@
 //! Wire protocol (over one WebSocket). The viewer is **request-driven**: it asks
 //! for exactly the viewport it needs and the server answers from the DB.
 //!   client → server (JSON text): `{type:"viewport",t0,t1,px,req}`, `{type:"slowlog",…}`,
-//!     `{type:"stats",…}`.
+//!     `{type:"stats",…}`, `{type:"samples",t0,t1}`.
 //!   server → client: a `viewport` reply is a compact **binary columnar frame**
 //!     (see `encode_window` / the TS `decodeWindow`) — typed-array columns + a small
-//!     JSON header; `slowlog`/`stats`/`meta`/`head`/`status` are JSON text.
+//!     JSON header; `slowlog`/`stats`/`samples`/`meta`/`head`/`status` are JSON text.
+//! The lag/CPU bands and the System panel are sourced from the trace stream (the
+//! `syssample` event + the `meta` frame), so a recording replays them identically —
+//! the `.glr` is the single source for all rendered data (no `/info` side channel).
 //! On connect the server sends a `meta` frame; while live it pushes a small `head`
 //! (span/total/bytes) on a timer so the viewer follows the edge. No server-side
 //! push of execution data — the client pulls each window, so there's no broadcast lag.
@@ -129,7 +132,7 @@ struct AppState {
     tracer_stalled: Arc<AtomicBool>,
     /// Long/blocked execution-duration thresholds (slow-log filter + sent to the viewer).
     thresholds: Thresholds,
-    /// Per-session secret required to reach `/ws`, `/info`, `/detach`. Supplied via
+    /// Per-session secret required to reach `/ws` and `/detach`. Supplied via
     /// the capability URL greenlane prints (`?token=…`); loading that URL sets a
     /// same-origin cookie the browser then sends automatically. Without it, a host
     /// reachable over the network can't read the timeline or POST `/detach`.
@@ -221,7 +224,6 @@ pub async fn serve(
     };
     let mut app = Router::new()
         .route("/ws", get(ws_handler))
-        .route("/info", get(info_handler))
         .route("/healthz", get(health_handler))
         .route("/detach", post(detach_handler));
 
@@ -232,7 +234,7 @@ pub async fn serve(
 
     // Permissive CORS only in frontend-dev mode (--web-dir), where the bun/vite
     // dev server is a different origin. In normal use the viewer is same-origin
-    // (embedded assets) and a per-session token gates /ws|/info|/detach (see
+    // (embedded assets) and a per-session token gates /ws|/detach (see
     // AppState::authed), so binding beyond localhost doesn't expose an open control
     // endpoint — a caller without the token (from the printed capability URL) is
     // rejected. (Dev mode disables the token; don't expose --web-dir publicly.)
@@ -244,7 +246,7 @@ pub async fn serve(
     let app = app.with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    // With auth on, print the capability URL (the token authorizes /ws, /info,
+    // With auth on, print the capability URL (the token authorizes /ws
     // /detach); with auth off, the bare URL is all that's needed.
     let url = if auth_enabled {
         format!("http://{addr}/?token={token}")
@@ -279,7 +281,7 @@ pub async fn serve(
 /// visitor sees a clear explanation rather than a viewer that can't connect. When
 /// the request carries a valid `?token=` (the capability URL greenlane prints) it
 /// also sets a same-origin `gl_token` cookie so the viewer's subsequent `/ws`,
-/// `/info`, `/detach` requests authenticate automatically.
+/// `/detach` requests authenticate automatically.
 async fn static_handler(
     State(st): State<AppState>,
     RawQuery(q): RawQuery,
@@ -405,37 +407,6 @@ async fn detach_handler(
     StatusCode::OK
 }
 
-/// GET /info — host/process/runtime details + live scheduler-lag for the System
-/// panel. Recordings (no live target) report what little they have, lag `null`.
-async fn info_handler(
-    State(st): State<AppState>,
-    RawQuery(q): RawQuery,
-    headers: HeaderMap,
-) -> Response {
-    if !st.authed(q.as_deref(), &headers) {
-        return (StatusCode::FORBIDDEN, "missing or invalid session token").into_response();
-    }
-    let live = !st.detached.load(Ordering::SeqCst);
-    let source = st
-        .source
-        .as_ref()
-        .map(|s| serde_json::json!({ "file": s.file, "bytes": s.bytes }));
-    let body = match &st.sys {
-        Some(sys) => sys.to_json(live, source),
-        None => serde_json::json!({
-            "pid": st.pid,
-            "live": live,
-            "source": source,
-            "tid": serde_json::Value::Null,
-            "kernel": serde_json::Value::Null,
-            "process": serde_json::Value::Null,
-            "python": serde_json::Value::Null,
-            "lag": serde_json::Value::Null,
-        }),
-    };
-    axum::Json(body).into_response()
-}
-
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(st): State<AppState>,
@@ -477,6 +448,14 @@ async fn client(mut socket: WebSocket, st: AppState) {
         // the viewer uses `traceMode` for the per-execution "why no full stack" copy.
         "traces": st.trace_mode.map(|m| m != "off"),
         "traceMode": st.trace_mode,
+        // Host/process/runtime facts for the System panel — folded into `meta`
+        // (no separate `/info` API). Present only for a live attach; `null` for a
+        // recording (which never had system info anyway). Live-updating lag/CPU
+        // rates come from the `samples` query, not here.
+        "system": st.sys.as_ref().map(|s| s.to_json(
+            !st.detached.load(Ordering::SeqCst),
+            st.source.as_ref().map(|src| serde_json::json!({ "file": src.file, "bytes": src.bytes })),
+        )),
     });
     if send_json(&mut socket, &meta).await.is_err() {
         return;
@@ -551,6 +530,11 @@ async fn client(mut socket: WebSocket, st: AppState) {
                     if now != last_head || stalled != last_stalled {
                         last_head = now;
                         last_stalled = stalled;
+                        // `head` is purely the live progress/follow signal now —
+                        // span/total/bytes counters + stall/retention. Scheduler-lag
+                        // and CPU rates are NOT here: they flow through the trace
+                        // stream as `syssample` events and are fetched via the
+                        // `samples` query, so the `.glr` is the single source.
                         let head = serde_json::json!({
                             "type": "head",
                             "spanNs": now.0,
@@ -561,14 +545,6 @@ async fn client(mut socket: WebSocket, st: AppState) {
                             "stalled": stalled,
                             // Retention horizon advances as old rows evict (live cap).
                             "retainedFromNs": st.db.retained_from(),
-                            // R13: current hub-thread scheduler-lag rate (ms/s), or null
-                            // where unsupported. The viewer plots it at the live edge
-                            // (spanNs), so it aligns to the trace axis with no clock map.
-                            "lagMsPerSec": st.sys.as_ref().and_then(|s| s.lag_rate_ms_s()),
-                            // Hub-thread on-CPU rate (ms/s; /1000 = utilization). Lets
-                            // the viewer keep the CPU band's live tail moving in the
-                            // pending area, the same way it does for lag.
-                            "cpuMsPerSec": st.sys.as_ref().and_then(|s| s.cpu_rate_ms_s()),
                         });
                         if send_json(&mut socket, &head).await.is_err() {
                             break;
@@ -724,6 +700,24 @@ async fn handle_request(st: &AppState, text: &str) -> Option<Message> {
                 _ => None,
             }
         }
+        // Scheduler-lag + CPU samples for the visible window — the single source for
+        // the lag/CPU bands (live and from a recording, since samples are recorded).
+        "samples" => {
+            let t0 = v.get("t0").and_then(|x| x.as_u64()).unwrap_or(0);
+            let t1 = v
+                .get("t1")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(i64::MAX as u64);
+            match st.db.query(Query::Samples { t0, t1 }).await {
+                Ok(Reply::Samples { ts, lag, cpu }) => Some(json_text(&SamplesMsg {
+                    ty: "samples",
+                    ts: &ts,
+                    lag: &lag,
+                    cpu: &cpu,
+                })),
+                _ => None,
+            }
+        }
         // Lazy per-execution detail: the window frame is render-only, so the viewer asks
         // for a hovered execution's func/task/stack here. `gid` + `startNs` identify the
         // execution (start is the viewer's f32-ms estimate, so the DB does a nearest
@@ -784,6 +778,18 @@ struct StatsMsg {
     p50: f64,
     p95: f64,
     p99: f64,
+}
+
+#[derive(Serialize)]
+struct SamplesMsg<'a> {
+    #[serde(rename = "type")]
+    ty: &'static str,
+    /// Sample times (ns since origin), 1:1 with `lag`/`cpu`.
+    ts: &'a [u64],
+    /// Run-queue-wait rate (ms/s) per sample.
+    lag: &'a [f64],
+    /// On-CPU rate (ms/s) per sample.
+    cpu: &'a [f64],
 }
 
 #[derive(Serialize)]

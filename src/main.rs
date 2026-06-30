@@ -228,7 +228,7 @@ enum Cmd {
         #[arg(long)]
         web_dir: Option<PathBuf>,
         /// Disable the viewer's session-token auth. By default greenlane gates
-        /// `/ws`, `/info`, and `/detach` on the token in the printed capability
+        /// `/ws` and `/detach` on the token in the printed capability
         /// URL; with `--no-auth` the bare URL works and anyone who can reach the
         /// port has full access. Use only on a trusted, local-only bind.
         #[arg(long)]
@@ -710,7 +710,7 @@ fn serve_mode(
     // its trace hook (the broken socket triggers cleanup in the bootstrap).
     let detached = Arc::new(AtomicBool::new(false));
 
-    // Host/process/runtime introspection + scheduler-lag sampling for /info.
+    // Host/process/runtime introspection + scheduler-lag sampling (System panel via meta; lag/CPU samples into the store).
     let sys = sysinfo::SysInfo::new(pid);
 
     // The blocking socket reader stays on its own std thread, feeding the DB.
@@ -935,7 +935,7 @@ fn read_executions(
                             }
                             if let Some((sys, run)) = &sys {
                                 if m.tid > 0 {
-                                    sys.set_tid(m.tid, run.clone());
+                                    sys.set_tid(m.tid, run.clone(), db.clone());
                                 }
                                 if !m.pyinfo.is_empty() {
                                     sys.set_pyinfo(&m.pyinfo);
@@ -987,8 +987,9 @@ fn read_executions(
                                 db.ingest_gc(std::mem::take(&mut pending_gc));
                             }
                         }
-                        // `execution` events are file-only; never on the wire.
-                        Some(Item::Execution(_)) | None => {}
+                        // `execution` + `syssample` events are file-only / sampler-fed;
+                        // the target never emits them on the wire.
+                        Some(Item::Execution(_)) | Some(Item::Sample(_)) | None => {}
                     }
                     if consumed >= buf.len() {
                         break;
@@ -1119,8 +1120,14 @@ fn open(
     // Stream the file into the DB chunk-by-chunk (bounded memory on open).
     let pid = record::ingest_file(file, &db)?;
     info!(executions = db.total(), bytes, file = %file.display(), "loaded recording");
+    // Resolve to an absolute path so the viewer can show the full location
+    // (the CLI arg may be relative). Fall back to the given path if the file
+    // can't be canonicalized.
     let source = Some(server::Source {
-        file: file.display().to_string(),
+        file: std::fs::canonicalize(file)
+            .unwrap_or_else(|_| file.to_path_buf())
+            .display()
+            .to_string(),
         bytes,
     });
 

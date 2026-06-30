@@ -27,6 +27,21 @@ pub struct Execution {
     pub stack: String,
 }
 
+/// One scheduler-lag + CPU sample for the hub thread, taken by greenlane's `/proc`
+/// sampler during a live attach. Recorded into the `.glr` (and ingested back on
+/// replay) so the scheduler-lag and CPU bands render identically live or from a
+/// recording — the `.glr` is the single source for all rendered data. Rates are
+/// milliseconds-of-wall per wall-second (out of ~1000).
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct SysSample {
+    /// Sample time in ns since the trace began.
+    pub start: u64,
+    /// Run-queue-wait rate (ms/s): the hub thread's scheduler lag.
+    pub lag_ms_s: f64,
+    /// On-CPU rate (ms/s) for the hub thread.
+    pub cpu_ms_s: f64,
+}
+
 /// A garbage-collection pause: a global stall of the whole gevent thread.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GcEvent {
