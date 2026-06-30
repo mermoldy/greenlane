@@ -1200,7 +1200,7 @@ sys.stdout.buffer.write(bytes(buf))
     fn run_bootstrap(
         template: &str,
         mode: crate::TraceMode,
-        warn_ns: u64,
+        long_ns: u64,
         driver: &str,
     ) -> Option<Vec<Item>> {
         use std::io::Read;
@@ -1228,7 +1228,7 @@ sys.stdout.buffer.write(bytes(buf))
         let listener = UnixListener::bind(&sock).ok()?;
         listener.set_nonblocking(true).ok();
 
-        let filled = crate::fill_template(template, &sock, mode, warn_ns);
+        let filled = crate::fill_template(template, &sock, mode, long_ns);
         let cleanup = || {
             let _ = std::fs::remove_file(&sock);
             let _ = std::fs::remove_file(&script);

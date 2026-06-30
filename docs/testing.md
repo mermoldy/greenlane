@@ -61,7 +61,7 @@ the WebGL renderer.
 zigzag encoding, string and stack interning/dedup, the schema and meta frames, and
 switch/gc events including the 24-bit timestamp delta and its reset on a large gap.
 `tests/test_bootstrap.py` materializes `src/bootstrap.py` the way the Rust injector
-does — inlining `src/glr.py` and substituting the `__TRACE_MODE__` / `__WARN_NS__` /
+does — inlining `src/glr.py` and substituting the `__TRACE_MODE__` / `__LONG_NS__` /
 `__SOCKET_PATH__` placeholders — and compiles the result at every trace mode, so a
 broken template or encoder is caught without a live target. (The bootstraps target
 CPython 3.14+, so a 3.14+ interpreter is required.) Use the pinned tools via `uv`

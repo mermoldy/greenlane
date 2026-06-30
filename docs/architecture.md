@@ -113,8 +113,8 @@ Above the greenlets, a CPU graph tracks the busy fraction of the single schedule
 thread in step with the executions below, and vertical markers call out each garbage
 collection, with the generation, duration and objects freed available on hover.
 Runs that stretch into the tens of milliseconds are tinted to draw the eye —
-yellow past the warn threshold (≈20 ms) and red past the block threshold
-(≈50 ms), both configurable with `--warn-ms` / `--block-ms`, and with the
+yellow past the long threshold (≈20 ms) and red past the blocked threshold
+(≈50 ms), both configurable with `--long-ms` / `--blocked-ms`, and with the
 scheduler greenlet itself never flagged since it is expected to dominate while the
 loop is idle.
 
@@ -124,8 +124,8 @@ Those slow executions are also gathered into a collapsible **slow log** docked a
 bottom of the viewer. Unlike the timeline (which only holds the visible
 viewport), the slow log is a query run in the database over the **whole** capture,
 so it surfaces every execution past the threshold no matter where you're zoomed — its
-badge shows the true total count, not a windowed sample. Filter it (all / warn /
-block-tier only), sort by time or duration, and click any row to seek the
+badge shows the true total count, not a windowed sample. Filter it (all / long /
+blocked-tier only), sort by time or duration, and click any row to seek the
 timeline straight to that execution. It runs even while collapsed, so the badge stays
 live and opening it is instant.
 
@@ -142,7 +142,7 @@ walk runs at a execution's _close_ — when its duration is known — on the gre
 that just yielded, so the captured stack is the execution's **yield point** (where it
 gave up control, often the blocking call). Modes:
 
-- **`slow`** (default): walk only executions at/over the warn threshold (`--warn-ms`).
+- **`slow`** (default): walk only executions at/over the long threshold (`--long-ms`).
   The cost is paid solely for the slow executions you'd investigate, so traces are
   cheap enough to leave on.
 - **`all`**: walk every execution (exhaustive; a walk per greenlet switch).

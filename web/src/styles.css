@@ -33,8 +33,8 @@
   --ac-cyan: #88c0d0; /* recording / file */
   --ac-blue: #81a1c1; /* keys / links / focus */
   --ac-follow: #5e81ac; /* follow toggle */
-  --ac-warn: #ebcb8b; /* warn tier (amber) */
-  --ac-block: #e8606b; /* block tier / error (red) */
+  --ac-long: #ebcb8b; /* warn tier (amber) */
+  --ac-blocked: #e8606b; /* block tier / error (red) */
   --ac-gc: #c8a0e6; /* GC markers (purple) */
   --ac-cpu: #e8b563; /* CPU-band line (its own amber) */
 }
@@ -73,7 +73,7 @@ body {
 .errorbox h1 {
   margin: 0 0 8px;
   font-size: 16px;
-  color: var(--ac-block);
+  color: var(--ac-blocked);
 }
 .errorbox p {
   margin: 0 0 12px;
@@ -84,7 +84,7 @@ body {
   padding: 8px 10px;
   background: var(--bg-float);
   border-radius: 5px;
-  color: var(--ac-warn);
+  color: var(--ac-long);
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -184,7 +184,7 @@ body {
   background: var(--ac-green);
 }
 .dot.dead {
-  background: var(--ac-block);
+  background: var(--ac-blocked);
 }
 .dot.file {
   background: var(--ac-cyan);
@@ -272,6 +272,24 @@ button.danger:hover:not(:disabled) {
 .ctlsort select {
   width: auto;
 }
+/* Bottom-bar dropdowns (sort / color / time): pull the icon INSIDE the control
+   box so it reads as one unit — [icon value ▾] — instead of a glyph floating
+   beside a separately-bordered select. The label becomes the box; the select
+   goes transparent and borderless within it. */
+.bottombar .ctl {
+  gap: 5px;
+  padding: 2px 6px;
+  background: var(--bd);
+  border: 1px solid var(--bd-strong);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.bottombar .ctl select {
+  background: none;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+}
 
 .bottombar {
   position: relative;
@@ -319,11 +337,11 @@ button.danger:hover:not(:disabled) {
   text-align: center;
   color: var(--bg-app);
 }
-.slowtoggle .slowbadge.warn {
-  background: var(--ac-warn);
+.slowtoggle .slowbadge.long {
+  background: var(--ac-long);
 }
 .slowtoggle .slowbadge.blocked {
-  background: var(--ac-block);
+  background: var(--ac-blocked);
 }
 .slowtoggle .slowbadge.zero {
   opacity: 0.4;
@@ -560,7 +578,7 @@ button.danger:hover:not(:disabled) {
   flex: none;
 }
 .panel-head .name {
-  color: var(--ac-warn);
+  color: var(--ac-long);
   font-weight: 600;
   flex: 1;
 }
@@ -632,7 +650,7 @@ button.danger:hover:not(:disabled) {
   word-break: break-all;
 }
 .tframe.leaf .fn {
-  color: var(--ac-warn);
+  color: var(--ac-long);
 }
 .tframe.lib .fn {
   color: var(--tx-muted);
@@ -733,7 +751,7 @@ canvas.overlay {
   min-width: 34px;
 }
 .tooltip .name {
-  color: var(--ac-warn);
+  color: var(--ac-long);
   font-weight: 600;
   margin-bottom: 4px;
 }
@@ -750,7 +768,7 @@ canvas.overlay {
   line-height: 1.5;
 }
 .tooltip .frame.leaf {
-  color: var(--ac-warn);
+  color: var(--ac-long);
 }
 .tooltip .frame .sloc {
   color: var(--tx-faint);
@@ -858,7 +876,7 @@ canvas.overlay {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--ac-warn);
+  color: var(--ac-long);
   margin-bottom: 7px;
 }
 .trace-off p {

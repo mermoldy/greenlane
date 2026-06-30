@@ -61,8 +61,8 @@ type WsMsg =
       spanNs: number;
       totalExecutions: number;
       bytes: number;
-      warnNs: number;
-      blockNs: number;
+      longNs: number;
+      blockedNs: number;
       traces: boolean | null;
       traceMode: "off" | "slow" | "all" | null;
       retainedFromNs: number;
@@ -87,7 +87,7 @@ type WsMsg =
       type: "slowlog";
       rows: SlowRow[];
       total: number;
-      warnTotal: number;
+      longTotal: number;
       blockedTotal: number;
     }
   | { type: "stats"; p50: number; p95: number; p99: number }
@@ -147,8 +147,8 @@ function App() {
   const [lag, setLag] = useState(0); // arrival lag (ms): real-time minus newest execution
   const [bufCount, setBufCount] = useState(0); // executions loaded in the viewer's window
   const [capped, setCapped] = useState(false); // window hit the execution cap
-  const [warnMs, setWarnMs] = useState(20); // warn threshold (ms), from server
-  const [blockMs, setBlockMs] = useState(50); // block threshold (ms), from server
+  const [longMs, setLongMs] = useState(20); // long threshold (ms), from server
+  const [blockedMs, setBlockedMs] = useState(50); // blocked threshold (ms), from server
   const [source, setSource] = useState<Source | null>(null);
   // Server-authoritative running totals, held in refs and surfaced via the poll
   // so they don't re-render per message.
@@ -182,13 +182,13 @@ function App() {
   // Slow-log panel height (px). Draggable via the handle on its top edge so it
   // can be expanded up to read more rows; clamped in SlowLog's resize handler.
   const [slowHeight, setSlowHeight] = useState(230);
-  const [slowLevel, setSlowLevel] = useState<"all" | "warn" | "block">("all");
+  const [slowLevel, setSlowLevel] = useState<"all" | "long" | "blocked">("all");
   const [slowSort, setSlowSort] = useState<"time" | "dur">("time");
   const [slowRows, setSlowRows] = useState<SlowRow[]>([]);
   const [slowTotal, setSlowTotal] = useState(0); // true count (uncapped) from DB
   // Per-tier whole-capture counts (independent of the panel's level filter) — drive
-  // the toggle button's amber (warn-band) and red (block-band) badges.
-  const [slowWarn, setSlowWarn] = useState(0);
+  // the toggle button's amber (long-band) and red (blocked-band) badges.
+  const [slowLong, setSlowLong] = useState(0);
   const [slowBlocked, setSlowBlocked] = useState(0);
   // True while a *fresh* slow-log query (level/sort/open change) is in flight, so
   // the panel can mask the stale rows until the new ones land. Background polls
@@ -567,12 +567,12 @@ function App() {
             totalRef.current = msg.totalExecutions;
             // Span-duration thresholds (configurable server-side): drive execution
             // colors, slow-log labels, and durColor.
-            const wMs = msg.warnNs / 1e6;
-            const bMs = msg.blockNs / 1e6;
-            gWarnMs = wMs;
-            gBlockMs = bMs;
-            setWarnMs(wMs);
-            setBlockMs(bMs);
+            const wMs = msg.longNs / 1e6;
+            const bMs = msg.blockedNs / 1e6;
+            gLongMs = wMs;
+            gBlockedMs = bMs;
+            setLongMs(wMs);
+            setBlockedMs(bMs);
             originRef.current = msg.originNs;
             setEvictedFromNs(
               msg.retainedFromNs > msg.originNs ? msg.retainedFromNs : 0,
@@ -621,7 +621,7 @@ function App() {
           case "slowlog":
             setSlowRows(msg.rows);
             setSlowTotal(msg.total);
-            setSlowWarn(msg.warnTotal);
+            setSlowLong(msg.longTotal);
             setSlowBlocked(msg.blockedTotal);
             setSlowLoading(false);
             break;
@@ -753,9 +753,9 @@ function App() {
             }
             style={
               lag >= 5000
-                ? { color: "var(--ac-block)" } // red: seriously behind
+                ? { color: "var(--ac-blocked)" } // red: seriously behind
                 : lag >= 1000
-                  ? { color: "var(--ac-warn)" } // amber: starting to trail
+                  ? { color: "var(--ac-long)" } // amber: starting to trail
                   : undefined // normal
             }
           >
@@ -766,7 +766,7 @@ function App() {
           <span
             className="stat"
             title="The visible range has more executions than the render cap; zoom in to see them all."
-            style={{ color: "var(--ac-warn)" }}
+            style={{ color: "var(--ac-long)" }}
           >
             ⚠ capped
           </span>
@@ -775,7 +775,7 @@ function App() {
           <span
             className="stat"
             title={`Live retention: this session caps how much it keeps in memory, so executions older than ${formatTime((evictedFromNs - originRef.current) / 1e6)} into the capture have been evicted. The slow log, percentiles, and counts describe only retained data. Record (omit --serve, or add --out) to keep everything.`}
-            style={{ color: "var(--ac-warn)" }}
+            style={{ color: "var(--ac-long)" }}
           >
             ⚠ old data evicted
           </span>
@@ -862,8 +862,8 @@ function App() {
           loading={slowLoading}
           level={slowLevel}
           sort={slowSort}
-          warnMs={warnMs}
-          blockMs={blockMs}
+          longMs={longMs}
+          blockedMs={blockedMs}
           height={slowHeight}
           onResize={setSlowHeight}
           onLevel={setSlowLevel}
@@ -878,19 +878,19 @@ function App() {
             className={`slowtoggle${slowOpen ? " on" : ""}`}
             onClick={() => setSlowOpen((v) => !v)}
             aria-pressed={slowOpen}
-            title={`Spans that ran long enough to stall the scheduler (≥${warnMs}ms), queried from the database.`}
+            title={`Spans that ran long enough to stall the scheduler (≥${longMs}ms), queried from the database.`}
           >
             <IconSlow /> slow log{" "}
             <span className="slowbadges">
               <span
-                className={`slowbadge warn${slowWarn === 0 ? " zero" : ""}`}
-                title={`${slowWarn.toLocaleString()} warning execution${slowWarn === 1 ? "" : "s"} (${warnMs}–${blockMs}ms).`}
+                className={`slowbadge long${slowLong === 0 ? " zero" : ""}`}
+                title={`${slowLong.toLocaleString()} long execution${slowLong === 1 ? "" : "s"} (${longMs}–${blockedMs}ms).`}
               >
-                {slowWarn.toLocaleString()}
+                {slowLong.toLocaleString()}
               </span>
               <span
                 className={`slowbadge blocked${slowBlocked === 0 ? " zero" : ""}`}
-                title={`${slowBlocked.toLocaleString()} blocked execution${slowBlocked === 1 ? "" : "s"} (≥${blockMs}ms).`}
+                title={`${slowBlocked.toLocaleString()} blocked execution${slowBlocked === 1 ? "" : "s"} (≥${blockedMs}ms).`}
               >
                 {slowBlocked.toLocaleString()}
               </span>
@@ -941,7 +941,7 @@ function App() {
           </label>
           <label
             className="ctl"
-            title="Greenlet fill color: by greenlet identity, by execution duration (blue < warn, yellow < block, red beyond), or as a heatmap (continuous blue→yellow→red gradient by run length, anchored to the warn/block thresholds). Hub stays green."
+            title="Greenlet fill color: by greenlet identity, by execution duration (blue < long, yellow < blocked, red beyond), or as a heatmap (continuous blue→yellow→red gradient by run length, anchored to the long/blocked thresholds). Hub stays green."
           >
             <IconColor />
             <select
@@ -955,13 +955,13 @@ function App() {
             >
               <option
                 value="duration"
-                title="Color executions by how long they ran: blue < warn, yellow < block, red beyond. Hub stays green."
+                title="Color executions by how long they ran: blue < long, yellow < blocked, red beyond. Hub stays green."
               >
                 duration
               </option>
               <option
                 value="heatmap"
-                title="Color executions on a continuous blue→yellow→red gradient by run length: blue at/under 1ms, yellow at the warn threshold, red at/over the block threshold, interpolated between (cool leg log-scaled). Hub stays green."
+                title="Color executions on a continuous blue→yellow→red gradient by run length: blue at/under 1ms, yellow at the long threshold, red at/over the blocked threshold, interpolated between (cool leg log-scaled). Hub stays green."
               >
                 heatmap
               </option>
@@ -1247,8 +1247,8 @@ function SlowLog({
   loading,
   level,
   sort,
-  warnMs,
-  blockMs,
+  longMs,
+  blockedMs,
   height,
   onResize,
   onLevel,
@@ -1259,13 +1259,13 @@ function SlowLog({
   rows: SlowRow[];
   total: number;
   loading: boolean;
-  level: "all" | "warn" | "block";
+  level: "all" | "long" | "blocked";
   sort: "time" | "dur";
-  warnMs: number;
-  blockMs: number;
+  longMs: number;
+  blockedMs: number;
   height: number;
   onResize: (h: number) => void;
-  onLevel: (l: "all" | "warn" | "block") => void;
+  onLevel: (l: "all" | "long" | "blocked") => void;
   onSort: (s: "time" | "dur") => void;
   onPick: (row: SlowRow) => void;
   onClose: () => void;
@@ -1289,10 +1289,10 @@ function SlowLog({
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
   }
-  // The DB filters by tier server-side (all = warn+block, warn = warn-band only,
-  // block = block-band only) BEFORE the display limit, so `rows`/`total` are
+  // The DB filters by tier server-side (all = long+blocked, long = long-band only,
+  // blocked = blocked-band only) BEFORE the display limit, so `rows`/`total` are
   // already the requested tier — no client-side re-filter (which would miss
-  // warn-tier rows when blocks fill the limited page).
+  // long-tier rows when blocks fill the limited page).
   const shown = rows;
   return (
     <div className="slowlog" style={{ height }}>
@@ -1312,21 +1312,21 @@ function SlowLog({
             <button
               className={level === "all" ? "sel" : ""}
               onClick={() => onLevel("all")}
-              title={`All executions ≥ ${warnMs}ms.`}
+              title={`All executions ≥ ${longMs}ms.`}
             >
               all
             </button>
             <button
-              className={level === "warn" ? "sel" : ""}
-              onClick={() => onLevel("warn")}
-              title={`Warning tier: ${warnMs}–${blockMs}ms — getting long.`}
+              className={level === "long" ? "sel" : ""}
+              onClick={() => onLevel("long")}
+              title={`Long tier: ${longMs}–${blockedMs}ms — getting long.`}
             >
-              warn
+              long
             </button>
             <button
-              className={level === "block" ? "sel" : ""}
-              onClick={() => onLevel("block")}
-              title={`Blocking tier: ≥ ${blockMs}ms — long enough to stall the scheduler.`}
+              className={level === "blocked" ? "sel" : ""}
+              onClick={() => onLevel("blocked")}
+              title={`Blocked tier: ≥ ${blockedMs}ms — long enough to stall the scheduler.`}
             >
               blocked
             </button>
@@ -1365,11 +1365,11 @@ function SlowLog({
           <>
             {shown.length === 0 && (
               <div className="slowrow muted">
-                {level === "block"
-                  ? `no executions ≥ ${blockMs} ms yet`
-                  : level === "warn"
-                    ? `no executions in the ${warnMs}–${blockMs} ms range yet`
-                    : `no executions ≥ ${warnMs} ms yet`}
+                {level === "blocked"
+                  ? `no executions ≥ ${blockedMs} ms yet`
+                  : level === "long"
+                    ? `no executions in the ${longMs}–${blockedMs} ms range yet`
+                    : `no executions ≥ ${longMs} ms yet`}
               </div>
             )}
             {shown.map((s, i) => (
@@ -1378,7 +1378,7 @@ function SlowLog({
                   className="lvl"
                   style={{
                     background:
-                      s.level >= 2 ? "var(--ac-block)" : "var(--ac-warn)",
+                      s.level >= 2 ? "var(--ac-blocked)" : "var(--ac-long)",
                   }}
                 />
                 <span className="sdur" style={{ color: durColor(s.dur / 1e6) }}>
@@ -1396,15 +1396,15 @@ function SlowLog({
   );
 }
 
-// Warn/block thresholds (ms), updated from the server `meta`. Module-level so the
+// Long/blockeded thresholds (ms), updated from the server `meta`. Module-level so the
 // pure durColor helper (used in several places) reflects config without prop drilling.
-let gWarnMs = 20;
-let gBlockMs = 50;
+let gLongMs = 20;
+let gBlockedMs = 50;
 
-// Duration → highlight color: yellow ≥ warn, red ≥ block.
+// Duration → highlight color: yellow ≥ long, red ≥ blocked.
 function durColor(ms: number): string | undefined {
-  if (ms >= gBlockMs) return "var(--ac-block)";
-  if (ms >= gWarnMs) return "var(--ac-warn)";
+  if (ms >= gBlockedMs) return "var(--ac-blocked)";
+  if (ms >= gLongMs) return "var(--ac-long)";
   return undefined;
 }
 
@@ -1736,7 +1736,7 @@ function TracePanel({
             </pre>
             <p className="trace-off-warn">
               <code>slow</code> (the default) walks the stack only for
-              executions over the warn threshold — cheap enough to leave on;{" "}
+              executions over the long threshold — cheap enough to leave on;{" "}
               <code>all</code> captures every execution.
             </p>
           </div>
@@ -1744,13 +1744,13 @@ function TracePanel({
         {noStackHint === "slow" && (
           <div className="trace-off">
             <p>
-              This execution ran under the warn threshold, so its full stack
+              This execution ran under the long threshold, so its full stack
               wasn't captured (<code>--include-traces slow</code> walks only
               slow executions). Its leaf function is shown above.
             </p>
             <p className="trace-off-warn">
               Re-attach with <code>--include-traces all</code> to capture every
-              execution's stack, or lower <code>--warn-ms</code> to widen what
+              execution's stack, or lower <code>--long-ms</code> to widen what
               counts as slow.
             </p>
           </div>

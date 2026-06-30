@@ -132,7 +132,7 @@ path for you to load into the target yourself.
 ## Finding slow executions
 
 Spans that run long enough to stall the scheduler are tinted on the timeline
-(yellow past ≈20 ms, red past ≈50 ms — tune with `--warn-ms` / `--block-ms`) and
+(yellow past ≈20 ms, red past ≈50 ms — tune with `--long-ms` / `--blocked-ms`) and
 collected into a **slow log** docked at the bottom of the viewer. It's a query
 over the _whole_ capture (not just what's on screen), so its badge is the true
 count; filter it by tier, sort by time or duration, and click a row to jump the
@@ -148,8 +148,8 @@ greenlane attach <PID> --include-traces all --serve   # every execution
 `--include-traces` takes `off`, `slow`, or `all`, defaulting to **`slow`** (a bare
 `--include-traces` also means `slow`):
 
-- **`slow`** (default) — capture the full stack **only for executions at/over the warn
-  threshold** (`--warn-ms`, default 20 ms). Walking the Python stack is the
+- **`slow`** (default) — capture the full stack **only for executions at/over the long
+  threshold** (`--long-ms`, default 20 ms). Walking the Python stack is the
   hot-path cost, so it's done at a execution's _close_ (when its duration is known) and
   only for the slow executions you'd actually investigate. Cheap enough to leave on.
 - **`all`** — full stack for every execution. Exhaustive, but walks on every greenlet
@@ -174,9 +174,9 @@ how to run the automated checks are covered in **[docs/testing.md](docs/testing.
 Useful flags:
 
 - `--include-traces <off|slow|all>` — full call-stack capture (default `slow`:
-  stacks for executions over `--warn-ms`; `all` for every execution; `off` for none — see
+  stacks for executions over `--long-ms`; `all` for every execution; `off` for none — see
   [Finding slow executions](#finding-slow-executions)).
-- `--warn-ms <n>` / `--block-ms <n>` — slow-execution highlight + slow-log thresholds
+- `--long-ms <n>` / `--blocked-ms <n>` — slow-execution highlight + slow-log thresholds
   (default 20 / 50 ms).
 - `--python <bin>` — helper interpreter that drives `sys.remote_exec` (3.14+).
 - `--out <path>` — where to save the recording.

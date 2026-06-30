@@ -35,7 +35,7 @@ use tracing_subscriber::EnvFilter;
 use db::{Db, FuncAgg, GcGen, GreenletAgg, Query, Reply, SlowRow, SlowTier};
 use store::{Execution, GcEvent};
 
-/// The gevent bootstrap, with `__SOCKET_PATH__` / `__TRACE_MODE__` / `__WARN_NS__`
+/// The gevent bootstrap, with `__SOCKET_PATH__` / `__TRACE_MODE__` / `__LONG_NS__`
 /// placeholders (and a `# __GLR_ENCODER__` marker) we substitute at runtime.
 const BOOTSTRAP: &str = include_str!("bootstrap.py");
 
@@ -59,25 +59,30 @@ struct Cli {
     /// (an explicit `RUST_LOG` still wins if set).
     #[arg(long, global = true)]
     debug: bool,
-    /// "Warn" threshold (ms): executions at least this long are highlighted yellow and
-    /// listed in the slow log. Also via `GREENLANE_WARN_MS`.
-    #[arg(long, env = "GREENLANE_WARN_MS", default_value_t = 20, global = true)]
-    warn_ms: u64,
-    /// "Block" threshold (ms): executions at least this long are highlighted red — long
-    /// enough to stall the scheduler. Also via `GREENLANE_BLOCK_MS`.
-    #[arg(long, env = "GREENLANE_BLOCK_MS", default_value_t = 50, global = true)]
-    block_ms: u64,
+    /// "Long" threshold (ms): executions at least this long are highlighted yellow and
+    /// listed in the slow log. Also via `GREENLANE_LONG_MS`.
+    #[arg(long, env = "GREENLANE_LONG_MS", default_value_t = 20, global = true)]
+    long_ms: u64,
+    /// "Blocked" threshold (ms): executions at least this long are highlighted red — long
+    /// enough to stall the scheduler. Also via `GREENLANE_BLOCKED_MS`.
+    #[arg(
+        long,
+        env = "GREENLANE_BLOCKED_MS",
+        default_value_t = 50,
+        global = true
+    )]
+    blocked_ms: u64,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
-/// Warn/block execution-duration thresholds (ns), configurable via flags/env. Drive
+/// Long/blocked execution-duration thresholds (ns), configurable via flags/env. Drive
 /// the slow-log filter + percentile context (server) and execution highlight colors
-/// (client, via `meta`), and the warn/block debug logging during capture.
+/// (client, via `meta`), and the long/blocked debug logging during capture.
 #[derive(Clone, Copy)]
 pub struct Thresholds {
-    pub warn_ns: u64,
-    pub block_ns: u64,
+    pub long_ns: u64,
+    pub blocked_ns: u64,
 }
 
 /// How diagnostics are rendered. The level filter is independent — set it with
@@ -95,7 +100,7 @@ enum LogFormat {
 enum TraceMode {
     /// No full stacks — only the cheap leaf-function label per execution.
     Off,
-    /// Full stack only for executions at/over the warn threshold (the default): the
+    /// Full stack only for executions at/over the long threshold (the default): the
     /// walk runs solely for the slow executions you'd actually investigate.
     Slow,
     /// Full stack for every execution (exhaustive; walks on every switch).
@@ -190,7 +195,7 @@ enum Cmd {
         /// Full call-stack capture mode: `off`, `slow` (default), or `all`.
         /// Walking the Python stack is the hot-path cost, so it's gated to a execution's
         /// close (when its duration is known): `slow` walks only executions at/over the
-        /// warn threshold (`--warn-ms`) — the ones worth investigating — `all`
+        /// long threshold (`--long-ms`) — the ones worth investigating — `all`
         /// walks every execution, `off` keeps only the cheap leaf label. Bare
         /// `--include-traces` means `slow`. Every execution always carries its cheap
         /// leaf-function label regardless.
@@ -268,8 +273,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.log_format, cli.debug);
     let thresholds = Thresholds {
-        warn_ns: cli.warn_ms * 1_000_000,
-        block_ns: cli.block_ms * 1_000_000,
+        long_ns: cli.long_ms * 1_000_000,
+        blocked_ns: cli.blocked_ms * 1_000_000,
     };
     match cli.cmd {
         Cmd::Attach {
@@ -345,7 +350,7 @@ fn attach(
     }
 
     let bootstrap_path =
-        write_bootstrap(pid, &base, &sock_path, include_traces, thresholds.warn_ns)?;
+        write_bootstrap(pid, &base, &sock_path, include_traces, thresholds.long_ns)?;
     if no_inject {
         info!(
             "--no-inject — load this into the target yourself, e.g.\n    \
@@ -421,19 +426,19 @@ fn attach(
     Ok(())
 }
 
-/// Substitute the socket path, trace mode, and warn threshold into a bootstrap
+/// Substitute the socket path, trace mode, and long threshold into a bootstrap
 /// template, and inline the shared binary-trace encoder where the marker appears.
 fn fill_template(
     template: &str,
     sock_path: &Path,
     include_traces: TraceMode,
-    warn_ns: u64,
+    long_ns: u64,
 ) -> String {
     template
         .replace("# __GLR_ENCODER__", GLR_ENCODER)
         .replace("__SOCKET_PATH__", &sock_path.to_string_lossy())
         .replace("__TRACE_MODE__", &include_traces.as_wire().to_string())
-        .replace("__WARN_NS__", &warn_ns.to_string())
+        .replace("__LONG_NS__", &long_ns.to_string())
 }
 
 /// 16 bytes from the OS CSPRNG (`/dev/urandom`) as lowercase hex (32 chars). The
@@ -489,12 +494,12 @@ fn write_bootstrap(
     base: &Path,
     sock_path: &Path,
     include_traces: TraceMode,
-    warn_ns: u64,
+    long_ns: u64,
 ) -> Result<PathBuf> {
     write_script(
         base,
         &format!("greenlane-bootstrap-{pid}.py"),
-        &fill_template(BOOTSTRAP, sock_path, include_traces, warn_ns),
+        &fill_template(BOOTSTRAP, sock_path, include_traces, long_ns),
     )
 }
 
@@ -941,13 +946,13 @@ fn read_executions(
                             last_ts.insert(ev.thread, ev.ts);
                             if let Some((gid, start, name, func, task)) = cur.remove(&ev.thread) {
                                 let dur = ev.ts.saturating_sub(start);
-                                // Surface long (warn/block) non-Hub executions as they
+                                // Surface long/blocked non-Hub executions as they
                                 // close, so `--debug` shows stalls live during capture.
-                                if dur >= thresholds.warn_ns && !is_hub(&name) {
-                                    let level = if dur >= thresholds.block_ns {
-                                        "block"
+                                if dur >= thresholds.long_ns && !is_hub(&name) {
+                                    let level = if dur >= thresholds.blocked_ns {
+                                        "blocked"
                                     } else {
-                                        "warn"
+                                        "long"
                                     };
                                     debug!(
                                         level,
@@ -1166,10 +1171,10 @@ struct Report {
     #[serde(rename = "epochMs")]
     epoch_ms: Option<u64>,
     greenlets: u64,
-    #[serde(rename = "warnMs")]
-    warn_ms: u64,
-    #[serde(rename = "blockMs")]
-    block_ms: u64,
+    #[serde(rename = "longMs")]
+    long_ms: u64,
+    #[serde(rename = "blockedMs")]
+    blocked_ms: u64,
     #[serde(rename = "hubRunNs")]
     hub_run_ns: u64,
     #[serde(rename = "nonHubRunNs")]
@@ -1180,8 +1185,8 @@ struct Report {
     p95_ns: u64,
     #[serde(rename = "p99Ns")]
     p99_ns: u64,
-    #[serde(rename = "warnCount")]
-    warn_count: u64,
+    #[serde(rename = "longCount")]
+    long_count: u64,
     #[serde(rename = "blockedCount")]
     blocked_count: u64,
     #[serde(rename = "gcCount")]
@@ -1214,15 +1219,15 @@ fn analyze(file: &Path, format: AnalyzeFormat, top: usize, thresholds: Threshold
     let (summary, slow, stats) = rt.block_on(async {
         let summary = db
             .query(Query::Summary {
-                warn_ns: thresholds.warn_ns,
-                red_ns: thresholds.block_ns,
+                long_ns: thresholds.long_ns,
+                blocked_ns: thresholds.blocked_ns,
                 top,
             })
             .await?;
         let slow = db
             .query(Query::Slowlog {
-                warn_ns: thresholds.warn_ns,
-                red_ns: thresholds.block_ns,
+                long_ns: thresholds.long_ns,
+                blocked_ns: thresholds.blocked_ns,
                 tier: SlowTier::All,
                 sort_dur: true,
                 limit: top,
@@ -1241,7 +1246,7 @@ fn analyze(file: &Path, format: AnalyzeFormat, top: usize, thresholds: Threshold
         greenlets,
         hub_run_ns,
         nonhub_run_ns,
-        warn_count,
+        long_count,
         blocked_count,
         top_greenlets,
         top_funcs,
@@ -1267,14 +1272,14 @@ fn analyze(file: &Path, format: AnalyzeFormat, top: usize, thresholds: Threshold
         span_ns: db.span().saturating_sub(db.origin()),
         epoch_ms: db.epoch(),
         greenlets,
-        warn_ms: thresholds.warn_ns / 1_000_000,
-        block_ms: thresholds.block_ns / 1_000_000,
+        long_ms: thresholds.long_ns / 1_000_000,
+        blocked_ms: thresholds.blocked_ns / 1_000_000,
         hub_run_ns,
         nonhub_run_ns,
         p50_ns: p50 as u64,
         p95_ns: p95 as u64,
         p99_ns: p99 as u64,
-        warn_count,
+        long_count,
         blocked_count,
         gc_count,
         gc_total_ns,
@@ -1349,15 +1354,15 @@ fn print_report_text(r: &Report) {
         fmt_ns(r.p99_ns),
     );
 
-    println!("\nSlow executions (≥ warn {}ms)", r.warn_ms);
+    println!("\nSlow executions (≥ long {}ms)", r.long_ms);
     println!(
-        "  warn: {}   block (≥ {}ms): {}",
-        r.warn_count, r.block_ms, r.blocked_count
+        "  long: {}   blocked (≥ {}ms): {}",
+        r.long_count, r.blocked_ms, r.blocked_count
     );
     if !r.slowest.is_empty() {
         println!("  slowest:");
         for s in &r.slowest {
-            let tier = if s.level >= 2 { "block" } else { "warn " };
+            let tier = if s.level >= 2 { "blocked" } else { "long " };
             let func = if s.func.is_empty() {
                 "(no func)"
             } else {
@@ -1453,8 +1458,8 @@ mod tests {
         let running = Arc::new(AtomicBool::new(true));
         let detached = Arc::new(AtomicBool::new(false));
         let thr = Thresholds {
-            warn_ns: 20_000_000,
-            block_ns: 50_000_000,
+            long_ns: 20_000_000,
+            blocked_ns: 50_000_000,
         };
 
         let reader = {

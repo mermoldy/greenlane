@@ -28,8 +28,8 @@ _GH_SOCK_PATH = "__SOCKET_PATH__"
 # execution, `slow` only executions at/over the warn threshold, `off` never. Every execution still
 # gets a cheap leaf-function label regardless.
 _GH_MODE = __TRACE_MODE__
-# Warn threshold (ns) — the slow/fast cutoff for `slow` mode. Matches --warn-ms.
-_GH_WARN_NS = __WARN_NS__
+# Warn threshold (ns) — the slow/fast cutoff for `slow` mode. Matches --long-ms.
+_GH_LONG_NS = __LONG_NS__
 
 
 # ── binary trace encoder (inlined from src/glr.py) ──────────────────────────
@@ -265,7 +265,7 @@ def _greenlane_install():
                     stack_frames = _walk_greenlet(origin)
                 elif _GH_MODE == 1:  # slow
                     dur = ts - _open_ts[0]
-                    if dur >= _GH_WARN_NS and not _is_hub(origin):
+                    if dur >= _GH_LONG_NS and not _is_hub(origin):
                         stack_frames = _walk_greenlet(origin)
                 _open_ts[0] = ts
                 # Intern strings/stack (emits pool frames on first sight), then the

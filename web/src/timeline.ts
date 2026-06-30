@@ -84,7 +84,7 @@ const SHRINK_SLACK = 4;
 // (re-centered) window load instead, bounding memory + keeping the f32 GPU-relative
 // `start` base near the view. Matches the server's WINDOW_CAP.
 const APPEND_MAX_ROWS = 2_000_000;
-const WARN_MS = 20; // executions longer than this get a yellow border
+const LONG_MS = 20; // executions longer than this get a yellow border
 const SLOW_MS = 50; // executions longer than this get a red border
 const BIN_MS = 1; // CPU histogram resolution: non-Hub run-time per 1ms bin
 const TEX_W = 4096; // row-lookup texture width; 2D-wrapped to scale past 16k tracks
@@ -190,8 +190,8 @@ void main() {
   vec3 col = v_color;
   if (v_slow > 0.5) {
     // Border highlight, keeping the fill in the track's own color.
-    // v_slow: 1 = warn (>20ms, yellow), 2 = slow (>50ms, red). Colors mirror the
-    // CSS tokens --ac-block (#e8606b) and --ac-warn (#ebcb8b).
+    // v_slow: 1 = long (>20ms, yellow), 2 = blocked (>50ms, red). Colors mirror the
+    // CSS tokens --ac-blocked (#e8606b) and --ac-long (#ebcb8b).
     float dx = min(v_local.x, 1.0 - v_local.x) * v_sizePx.x;
     float dy = min(v_local.y, 1.0 - v_local.y) * v_sizePx.y;
     if (min(dx, dy) < 2.0) {
@@ -220,14 +220,14 @@ function compile(
 const HUB_COLOR: [number, number, number] = [163 / 255, 190 / 255, 140 / 255];
 
 // "duration" color mode: fill greenlet executions by how long they ran rather than by
-// identity — blue under the warn threshold (ok), yellow up to the block
+// identity — blue under the long threshold (ok), yellow up to the blocked
 // threshold, red beyond it. The Hub keeps its theme green. Yellow/red match the
 // highlight-border tones so the two modes read consistently.
-const OK_COLOR: [number, number, number] = [0.36, 0.62, 0.92]; // blue: < warn
-// Warn/block fills mirror the CSS tokens --ac-warn (#ebcb8b) and --ac-block
+const OK_COLOR: [number, number, number] = [0.36, 0.62, 0.92]; // blue: < long
+// Long/blocked fills mirror the CSS tokens --ac-long (#ebcb8b) and --ac-blocked
 // (#e8606b); loadTheme() overrides these from the live tokens at construction.
-const DUR_WARN_COLOR: [number, number, number] = [0.922, 0.796, 0.545]; // #ebcb8b
-const DUR_SLOW_COLOR: [number, number, number] = [0.91, 0.376, 0.42]; // #e8606b
+const DUR_LONG_COLOR: [number, number, number] = [0.922, 0.796, 0.545]; // #ebcb8b
+const DUR_BLOCKED_COLOR: [number, number, number] = [0.91, 0.376, 0.42]; // #e8606b
 
 /** "#rrggbb" → 0..255 RGB triple (for ctx rgba() strings). */
 function hexToRgb255(hex: string): [number, number, number] {
@@ -323,7 +323,7 @@ export type SortMode =
 
 // How execution fill is colored: "ident" = a stable per-greenlet color (default);
 // "duration" = blue/yellow/red by run length (Hub stays green); "heatmap" = a
-// continuous blue→yellow→red gradient anchored to the warn/block thresholds (Hub green).
+// continuous blue→yellow→red gradient anchored to the long/blocked thresholds (Hub green).
 export type ColorMode = "ident" | "duration" | "heatmap";
 
 export class Timeline {
@@ -335,13 +335,13 @@ export class Timeline {
   private tBg = "#0d0f13"; // --bg-app (band/track background)
   private tMuted = "#8b93a3"; // --tx-muted (band labels)
   private tText2 = "#cdd3de"; // --tx-2 (help "?" text)
-  private tWarn = "#ebcb8b"; // --ac-warn
-  private tBlock = "#e8606b"; // --ac-block
+  private tLong = "#ebcb8b"; // --ac-long
+  private tBlocked = "#e8606b"; // --ac-blocked
   private tCpu = "#e8b563"; // --ac-cpu (CPU line)
   private tGc = "#c8a0e6"; // --ac-gc (GC band)
   private hubRgb = HUB_COLOR; // --ac-green, as WebGL float triple
-  private durWarnRgb = DUR_WARN_COLOR;
-  private durSlowRgb = DUR_SLOW_COLOR;
+  private durLongRgb = DUR_LONG_COLOR;
+  private durBlockedRgb = DUR_BLOCKED_COLOR;
   private prog: WebGLProgram;
   private vao: WebGLVertexArrayObject;
   private u: Record<string, WebGLUniformLocation | null> = {};
@@ -467,10 +467,10 @@ export class Timeline {
   private originNs = 0;
   private originSet = false;
   fullSpanMs = 0;
-  // Span highlight thresholds (ms): warn = yellow border, slow/block = red.
-  // Defaults match the server; overridden from `meta` (--warn-ms/--block-ms).
-  warnMs = WARN_MS;
-  slowMs = SLOW_MS;
+  // Span highlight thresholds (ms): long = yellow border, blocked = red.
+  // Defaults match the server; overridden from `meta` (--long-ms/--blocked-ms).
+  longMs = LONG_MS;
+  blockedMs = SLOW_MS;
   // Greenlet fill: by execution duration (default), greenlet identity, or heatmap.
   colorMode: ColorMode = "duration";
   /** Fired (throttled) when the visible range changes → app requests that window.
@@ -933,13 +933,13 @@ export class Timeline {
     this.tBg = v("--bg-app", this.tBg);
     this.tMuted = v("--tx-muted", this.tMuted);
     this.tText2 = v("--tx-2", this.tText2);
-    this.tWarn = v("--ac-warn", this.tWarn);
-    this.tBlock = v("--ac-block", this.tBlock);
+    this.tLong = v("--ac-long", this.tLong);
+    this.tBlocked = v("--ac-blocked", this.tBlocked);
     this.tCpu = v("--ac-cpu", this.tCpu);
     this.tGc = v("--ac-gc", this.tGc);
     this.hubRgb = hexToRgb01(v("--ac-green", "#a3be8c"));
-    this.durWarnRgb = hexToRgb01(this.tWarn);
-    this.durSlowRgb = hexToRgb01(this.tBlock);
+    this.durLongRgb = hexToRgb01(this.tLong);
+    this.durBlockedRgb = hexToRgb01(this.tBlocked);
   }
 
   /** rgba() string from a token hex + alpha — for translucent 2D overlays. */
@@ -1094,11 +1094,11 @@ export class Timeline {
     return 0;
   }
 
-  /** Warn/block execution-duration thresholds (ms), from the server config, so execution
+  /** Long/blocked execution-duration thresholds (ms), from the server config, so execution
    *  highlight colors match the slow-log filter. */
-  setThresholds(warnMs: number, slowMs: number) {
-    this.warnMs = warnMs;
-    this.slowMs = slowMs;
+  setThresholds(longMs: number, blockedMs: number) {
+    this.longMs = longMs;
+    this.blockedMs = blockedMs;
     this.dirty = true;
   }
 
@@ -1144,35 +1144,35 @@ export class Timeline {
 
   /** Duration-mode RGB for a execution of `durMs` (non-Hub). */
   private durRgb(durMs: number): [number, number, number] {
-    return durMs >= this.slowMs
-      ? this.durSlowRgb
-      : durMs >= this.warnMs
-        ? this.durWarnRgb
+    return durMs >= this.blockedMs
+      ? this.durBlockedRgb
+      : durMs >= this.longMs
+        ? this.durLongRgb
         : OK_COLOR;
   }
 
   /** Heatmap-mode RGB for an execution of `durMs` (non-Hub): a continuous
    *  blue → yellow → red gradient anchored to the duration thresholds — absolute
-   *  blue at/under 1ms, absolute yellow at the warn threshold, absolute red
-   *  at/over the block threshold, dynamically interpolated between. Uses the same
+   *  blue at/under 1ms, absolute yellow at the long threshold, absolute red
+   *  at/over the blocked threshold, dynamically interpolated between. Uses the same
    *  anchor colors as "duration" mode so the two read consistently. The cool
-   *  (blue→yellow) leg is log-scaled, since it spans the many sub-warn runs that
-   *  would otherwise bunch up near blue; the narrow warn→block leg is linear. */
+   *  (blue→yellow) leg is log-scaled, since it spans the many sub-long runs that
+   *  would otherwise bunch up near blue; the narrow long→blocked leg is linear. */
   private heatRgb(durMs: number): [number, number, number] {
     const floor = 1; // ms — at/below this is absolute blue
     const clamp01 = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x);
     if (durMs <= floor) return OK_COLOR;
-    if (durMs >= this.slowMs) return this.durSlowRgb;
-    if (durMs <= this.warnMs) {
-      // blue → yellow, log-scaled across (1ms, warn].
-      const denom = Math.log(this.warnMs) - Math.log(floor);
+    if (durMs >= this.blockedMs) return this.durBlockedRgb;
+    if (durMs <= this.longMs) {
+      // blue → yellow, log-scaled across (1ms, long].
+      const denom = Math.log(this.longMs) - Math.log(floor);
       const t = denom > 0 ? (Math.log(durMs) - Math.log(floor)) / denom : 1;
-      return lerpRgb(OK_COLOR, this.durWarnRgb, clamp01(t));
+      return lerpRgb(OK_COLOR, this.durLongRgb, clamp01(t));
     }
-    // yellow → red, linear across (warn, block).
-    const denom = this.slowMs - this.warnMs;
-    const t = denom > 0 ? (durMs - this.warnMs) / denom : 1;
-    return lerpRgb(this.durWarnRgb, this.durSlowRgb, clamp01(t));
+    // yellow → red, linear across (long, blocked).
+    const denom = this.blockedMs - this.longMs;
+    const t = denom > 0 ? (durMs - this.longMs) / denom : 1;
+    return lerpRgb(this.durLongRgb, this.durBlockedRgb, clamp01(t));
   }
 
   /** Record the absolute ns range a freshly-loaded window covers, so the frame
@@ -1303,9 +1303,9 @@ export class Timeline {
         this.cGid[j] = tracks[trackIdx[i]].gid;
         this.cSlow[j] = this.hubTrack[rt]
           ? 0
-          : d >= this.slowMs
+          : d >= this.blockedMs
             ? 2
-            : d >= this.warnMs
+            : d >= this.longMs
               ? 1
               : 0;
         rel[i] = relBase + startMs[i];
@@ -1846,7 +1846,7 @@ export class Timeline {
     );
     const pct = Math.round(this.cpuBusy(1000) * 100);
     ctx.font = "600 12px ui-monospace, Menlo, monospace";
-    ctx.fillStyle = pct > 85 ? this.tBlock : this.tCpu;
+    ctx.fillStyle = pct > 85 ? this.tBlocked : this.tCpu;
     ctx.textAlign = "right";
     ctx.fillText(`${pct}%`, cw - 6, hy);
     ctx.textAlign = "left";
@@ -1856,7 +1856,7 @@ export class Timeline {
       const x = Math.max(0, Math.min(cw - 1, Math.round(this.mouseX)));
       const v = col[x];
       const y = yOf(v);
-      ctx.fillStyle = this.tWarn;
+      ctx.fillStyle = this.tLong;
       ctx.beginPath();
       ctx.arc(x, y, 3, 0, Math.PI * 2);
       ctx.fill();
@@ -1872,7 +1872,7 @@ export class Timeline {
       ctx.fillRect(bx - 4, by - 9, tw + 8, 18);
       ctx.strokeStyle = "#3b4252";
       ctx.strokeRect(bx - 4, by - 9, tw + 8, 18);
-      ctx.fillStyle = this.tWarn;
+      ctx.fillStyle = this.tLong;
       ctx.fillText(label, bx, by);
     }
   }
@@ -2011,7 +2011,7 @@ export class Timeline {
       for (let x = 0; x < cw; x++) ctx.lineTo(x, yOf(col[x] / fullScale));
       ctx.lineTo(cw, plotBot);
       ctx.closePath();
-      ctx.fillStyle = this.rgba(this.tBlock, 0.18); // red-ish: starvation
+      ctx.fillStyle = this.rgba(this.tBlocked, 0.18); // red-ish: starvation
       ctx.fill();
       // Line.
       ctx.beginPath();
@@ -2020,7 +2020,7 @@ export class Timeline {
         if (x === 0) ctx.moveTo(x, y);
         else ctx.lineTo(x, y);
       }
-      ctx.strokeStyle = this.tBlock;
+      ctx.strokeStyle = this.tBlocked;
       ctx.lineWidth = 1;
       ctx.stroke();
 
@@ -2048,7 +2048,7 @@ export class Timeline {
     ctx.font = "600 12px ui-monospace, Menlo, monospace";
     // Severity: <5 healthy (neutral), 5–50 contention (amber), ≥50 serious (red).
     ctx.fillStyle =
-      cur >= 50 ? this.tBlock : cur >= 5 ? this.tWarn : this.tMuted;
+      cur >= 50 ? this.tBlocked : cur >= 5 ? this.tLong : this.tMuted;
     ctx.textAlign = "right";
     ctx.fillText(n > 0 ? `${cur.toFixed(1)} ms/s` : "n/a", cw - 6, hy);
     ctx.textAlign = "left";
@@ -2063,7 +2063,7 @@ export class Timeline {
       const x = Math.max(0, Math.min(cw - 1, Math.round(this.mouseX)));
       const v = col[x];
       const y = yOf(v / fullScale);
-      ctx.fillStyle = this.tBlock;
+      ctx.fillStyle = this.tBlocked;
       ctx.beginPath();
       ctx.arc(x, y, 3, 0, Math.PI * 2);
       ctx.fill();
@@ -2078,7 +2078,7 @@ export class Timeline {
       ctx.fillRect(bx - 4, by - 9, tw + 8, 18);
       ctx.strokeStyle = "#3b4252";
       ctx.strokeRect(bx - 4, by - 9, tw + 8, 18);
-      ctx.fillStyle = this.tBlock;
+      ctx.fillStyle = this.tBlocked;
       ctx.fillText(label, bx, by);
     }
   }
@@ -2296,7 +2296,7 @@ export class Timeline {
 
     if (this.mouseX >= 0 && this.mouseY >= RULER_H) {
       const t = this.viewT0 + this.mouseX / this.pxPerMs;
-      ctx.strokeStyle = this.rgba(this.tWarn, 0.5);
+      ctx.strokeStyle = this.rgba(this.tLong, 0.5);
       ctx.beginPath();
       ctx.moveTo(this.mouseX + 0.5, RULER_H);
       ctx.lineTo(this.mouseX + 0.5, ch);
@@ -2313,7 +2313,7 @@ export class Timeline {
       const bx = Math.min(this.mouseX + 8, cw - tw - 10);
       ctx.fillStyle = "rgba(33,37,46,0.95)";
       ctx.fillRect(bx - 4, 2, tw + 8, RULER_H - 4);
-      ctx.fillStyle = this.tWarn;
+      ctx.fillStyle = this.tLong;
       ctx.fillText(label, bx, RULER_H / 2);
     }
 

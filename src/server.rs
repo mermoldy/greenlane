@@ -127,7 +127,7 @@ struct AppState {
     /// advancing (the target's switch hook went quiet while the stream is otherwise
     /// alive). Surfaced in `head` + `/healthz` so the viewer stops chasing the edge.
     tracer_stalled: Arc<AtomicBool>,
-    /// Warn/block execution-duration thresholds (slow-log filter + sent to the viewer).
+    /// Long/blocked execution-duration thresholds (slow-log filter + sent to the viewer).
     thresholds: Thresholds,
     /// Per-session secret required to reach `/ws`, `/info`, `/detach`. Supplied via
     /// the capability URL greenlane prints (`?token=…`); loading that URL sets a
@@ -469,9 +469,9 @@ async fn client(mut socket: WebSocket, st: AppState) {
         // evicted past a cap; data before this point is gone (0 = nothing evicted).
         "retainedFromNs": st.db.retained_from(),
         // Span-duration thresholds (ns) so the viewer colors/labels match the
-        // server's slow-log filter; configurable via --warn-ms/--block-ms.
-        "warnNs": st.thresholds.warn_ns,
-        "blockNs": st.thresholds.block_ns,
+        // server's slow-log filter; configurable via --long-ms/--blocked-ms.
+        "longNs": st.thresholds.long_ns,
+        "blockedNs": st.thresholds.blocked_ns,
         // Trace mode (--include-traces): "off" | "slow" | "all", or null for
         // recordings (unknown). `traces` stays as a convenience bool (mode != off);
         // the viewer uses `traceMode` for the per-execution "why no full stack" copy.
@@ -654,15 +654,15 @@ async fn handle_request(st: &AppState, text: &str) -> Option<Message> {
         "slowlog" => {
             let level = v.get("level").and_then(|x| x.as_str()).unwrap_or("all");
             let tier = match level {
-                "warn" => crate::db::SlowTier::Warn,
-                "block" => crate::db::SlowTier::Block,
+                "long" => crate::db::SlowTier::Long,
+                "blocked" => crate::db::SlowTier::Blocked,
                 _ => crate::db::SlowTier::All,
             };
             let sort_dur = v.get("sort").and_then(|x| x.as_str()) == Some("dur");
             let limit = v.get("limit").and_then(|x| x.as_u64()).unwrap_or(500) as usize;
             let q = Query::Slowlog {
-                warn_ns: st.thresholds.warn_ns,
-                red_ns: st.thresholds.block_ns,
+                long_ns: st.thresholds.long_ns,
+                blocked_ns: st.thresholds.blocked_ns,
                 tier,
                 sort_dur,
                 limit,
@@ -675,13 +675,13 @@ async fn handle_request(st: &AppState, text: &str) -> Option<Message> {
                 Ok(Reply::Slowlog {
                     rows,
                     total,
-                    warn_total,
+                    long_total,
                     blocked_total,
                 }) => Some(json_text(&SlowlogMsg {
                     ty: "slowlog",
                     rows: &rows,
                     total,
-                    warn_total,
+                    long_total,
                     blocked_total,
                 })),
                 _ => None,
@@ -752,8 +752,8 @@ struct SlowlogMsg<'a> {
     ty: &'static str,
     rows: &'a [crate::db::SlowRow],
     total: usize,
-    #[serde(rename = "warnTotal")]
-    warn_total: usize,
+    #[serde(rename = "longTotal")]
+    long_total: usize,
     #[serde(rename = "blockedTotal")]
     blocked_total: usize,
 }
@@ -945,8 +945,8 @@ mod tests {
             sys: None,
             tracer_stalled: Arc::new(AtomicBool::new(false)),
             thresholds: Thresholds {
-                warn_ns: 20_000_000,
-                block_ns: 50_000_000,
+                long_ns: 20_000_000,
+                blocked_ns: 50_000_000,
             },
             token: Arc::from("test-token"),
             auth_enabled: false,
