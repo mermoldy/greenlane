@@ -252,7 +252,7 @@ enum Cmd {
         no_auth: bool,
     },
 
-    /// Analyze a recorded .glr timeline and print a headless report — no browser.
+    /// Analyze a recorded .glr timeline and print a headless report without browser.
     ///
     /// Loads the recording into the same store the viewer uses and runs the same
     /// queries (top stalls, GC pressure, greenlet imbalance, hottest functions), then
