@@ -49,6 +49,6 @@ def test_raw_bootstrap_still_carries_its_placeholders():
     """Guard against the template being accidentally pre-filled in the repo."""
     raw = (_SRC / "bootstrap.py").read_text()
     assert "__TRACE_MODE__" in raw
-    assert "__WARN_NS__" in raw
+    assert "__LONG_NS__" in raw
     assert "__SOCKET_PATH__" in raw
     assert "# __GLR_ENCODER__" in raw
