@@ -47,7 +47,7 @@ const MIN_PXPERMS = 1 / 200; // min zoom = 1px per 200ms
 const ZOOM_SENS = 0.0008; // wheel-zoom sensitivity (lower = finer/slower)
 const RULER_H = 22; // top time-ruler band, CSS px
 const CPU_H = 60; // CPU graph band under the ruler, CSS px
-const LAG_H = 30; // kernel scheduler-lag band under the CPU band (R13), CSS px
+const LAG_H = 34; // kernel scheduler-lag band under the CPU band (R13), CSS px
 const GAP_H = 7; // gap between the lag band and the first track
 const HEADER_H = RULER_H + CPU_H + LAG_H + GAP_H; // tracks begin below this
 // The lag band auto-scales its y-axis to the tallest sample in the visible window
@@ -56,6 +56,17 @@ const HEADER_H = RULER_H + CPU_H + LAG_H + GAP_H; // tracks begin below this
 // value: until lag exceeds it, the band tops out here so routine sub-ms jitter
 // stays low instead of being amplified to fill the band.
 const LAG_MIN_FULL_MS_S = 50;
+// Per-column stress thresholds for the CPU + scheduler-lag bands. The bands draw
+// calm/neutral and only the time slices whose own value crosses these turn red —
+// a hot window is highlighted in place, never recoloring the whole band by the
+// current/peak value. A momentary spike tints only its slice.
+// Stress tiers for the CPU + scheduler-lag bands. The bands shade from neutral
+// up through amber (warn) to red (bad) by value, over a long vertical gradient,
+// so a hot stretch warms gradually instead of flipping at an edge. Readouts and
+// hover dots use the same tiers, so the color always reflects the value.
+const CPU_WARN = 0.9; // hub-thread utilization > 90% → amber (CPU has no red tier)
+const LAG_WARN_MS_S = 20; // scheduler run-queue wait > 20 ms/s → amber
+const LAG_BAD_MS_S = 50; // > 50 ms/s → red (sustained run-queue starvation)
 const AXIS_X = 6; // shared left inset for axis labels (CPU % and track names)
 
 // Hover explanations for the "?" badges on the CPU and scheduler-lag band headers.
@@ -337,7 +348,7 @@ export class Timeline {
   private tText2 = "#cdd3de"; // --tx-2 (help "?" text)
   private tLong = "#ebcb8b"; // --ac-long
   private tBlocked = "#e8606b"; // --ac-blocked
-  private tCpu = "#e8b563"; // --ac-cpu (CPU line)
+  private tBand = "#9aa3b2"; // --ac-band (CPU + scheduler-lag lines: neutral, grid-matched)
   private tGc = "#c8a0e6"; // --ac-gc (GC band)
   private hubRgb = HUB_COLOR; // --ac-green, as WebGL float triple
   private durLongRgb = DUR_LONG_COLOR;
@@ -935,7 +946,7 @@ export class Timeline {
     this.tText2 = v("--tx-2", this.tText2);
     this.tLong = v("--ac-long", this.tLong);
     this.tBlocked = v("--ac-blocked", this.tBlocked);
-    this.tCpu = v("--ac-cpu", this.tCpu);
+    this.tBand = v("--ac-band", this.tBand);
     this.tGc = v("--ac-gc", this.tGc);
     this.hubRgb = hexToRgb01(v("--ac-green", "#a3be8c"));
     this.durLongRgb = hexToRgb01(this.tLong);
@@ -1704,6 +1715,74 @@ export class Timeline {
     this.rafId = requestAnimationFrame(this.frame);
   };
 
+  // A vertical gradient that colors a band by stress *level*. Each stop pins a
+  // color to the pixel row where a value lands (higher value = higher on the band
+  // = more stress), and the canvas blends linearly between them — so the band
+  // warms gradually from neutral over a long ramp instead of flipping at an edge
+  // (a hard per-column test reads as stripes; this does not). Pass stops in any
+  // order; rows outside the outermost stops clamp to that stop's color.
+  private stressGradient(
+    topY: number,
+    baseY: number,
+    stops: { y: number; color: string }[],
+    alpha: number,
+  ): CanvasGradient {
+    const span = baseY - topY || 1;
+    const c01 = (o: number) => Math.max(0, Math.min(1, o));
+    const g = this.ctx.createLinearGradient(0, topY, 0, baseY);
+    const withOff = stops
+      .map((s) => ({ off: c01((s.y - topY) / span), color: s.color }))
+      .sort((a, b) => a.off - b.off);
+    for (const s of withOff) g.addColorStop(s.off, this.rgba(s.color, alpha));
+    return g;
+  }
+
+  // Stress-tier color for a CPU utilization fraction and a scheduler-lag rate
+  // (ms/s). Used for the gradient anchors, the header readouts, and the hover
+  // dots/labels, so the color always reflects the value the same way in both
+  // bands. CPU tops out at amber (a busy hub thread isn't an error); lag escalates
+  // to red once run-queue wait is sustained.
+  private cpuTierColor(frac: number): string {
+    return frac > CPU_WARN ? this.tLong : this.tBand;
+  }
+  private lagTierColor(v: number): string {
+    return v >= LAG_BAD_MS_S
+      ? this.tBlocked
+      : v >= LAG_WARN_MS_S
+        ? this.tLong
+        : this.tBand;
+  }
+
+  // Draw a system-band series (filled area + line) for the column curve `yAt`,
+  // painted with the supplied styles. Pass the stress gradient as the paint to
+  // color the curve by height; the area and line take separate paints so each can
+  // carry its own alpha.
+  private drawBandSeries(
+    cw: number,
+    yAt: (x: number) => number,
+    baseY: number,
+    areaPaint: string | CanvasGradient,
+    linePaint: string | CanvasGradient,
+  ) {
+    const ctx = this.ctx;
+    ctx.beginPath();
+    ctx.moveTo(0, baseY);
+    for (let x = 0; x < cw; x++) ctx.lineTo(x, yAt(x));
+    ctx.lineTo(cw, baseY);
+    ctx.closePath();
+    ctx.fillStyle = areaPaint;
+    ctx.fill();
+    ctx.beginPath();
+    for (let x = 0; x < cw; x++) {
+      const y = yAt(x);
+      if (x === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = linePaint;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
   // Full-width CPU-busy area graph, time-aligned with the executions below (same
   // viewT0/pxPerMs), read from the prebuilt bin histogram so cost is ~O(width).
   // The metric is the single gevent OS-thread's busy fraction (non-Hub run
@@ -1785,34 +1864,22 @@ export class Timeline {
       }
     }
 
-    // Guide lines (behind the area).
-    ctx.strokeStyle = "rgba(120,130,150,0.12)";
-    for (const f of [0, 0.5, 1]) {
-      const y = yOf(f);
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(cw, y);
-      ctx.stroke();
+    // Area + line, colored by stress level over a long gradient: neutral at the
+    // 0 baseline, warming up the band to amber by 90% utilization (and amber on
+    // above). Keyed to height, so a busy stretch warms smoothly, no striping.
+    {
+      const stops = [
+        { y: yOf(0), color: this.tBand }, // 0% → neutral
+        { y: yOf(CPU_WARN), color: this.tLong }, // 90%+ → amber
+      ];
+      this.drawBandSeries(
+        cw,
+        (x) => yOf(col[x]),
+        plotBot,
+        this.stressGradient(plotTop, plotBot, stops, 0.18),
+        this.stressGradient(plotTop, plotBot, stops, 1),
+      );
     }
-
-    // Area + line.
-    const base = yOf(0);
-    ctx.beginPath();
-    ctx.moveTo(0, base);
-    for (let x = 0; x < cw; x++) ctx.lineTo(x, yOf(col[x]));
-    ctx.lineTo(cw, base);
-    ctx.closePath();
-    ctx.fillStyle = this.rgba(this.tCpu, 0.18);
-    ctx.fill();
-    ctx.beginPath();
-    for (let x = 0; x < cw; x++) {
-      const y = yOf(col[x]);
-      if (x === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.strokeStyle = this.tCpu;
-    ctx.lineWidth = 1;
-    ctx.stroke();
 
     // Header row: label on the left, current % on the right (no overlap with
     // the 100% guide, which is below this row).
@@ -1827,9 +1894,10 @@ export class Timeline {
       hy,
       CPU_HELP,
     );
-    const pct = Math.round(this.cpuBusy(1000) * 100);
+    const cpuFrac = this.cpuBusy(1000);
+    const pct = Math.round(cpuFrac * 100);
     ctx.font = "600 12px ui-monospace, Menlo, monospace";
-    ctx.fillStyle = pct > 85 ? this.tBlocked : this.tCpu;
+    ctx.fillStyle = this.cpuTierColor(cpuFrac);
     ctx.textAlign = "right";
     ctx.fillText(`${pct}%`, cw - 6, hy);
     ctx.textAlign = "left";
@@ -1839,7 +1907,8 @@ export class Timeline {
       const x = Math.max(0, Math.min(cw - 1, Math.round(this.mouseX)));
       const v = col[x];
       const y = yOf(v);
-      ctx.fillStyle = this.tLong;
+      const hoverColor = this.cpuTierColor(v);
+      ctx.fillStyle = hoverColor;
       ctx.beginPath();
       ctx.arc(x, y, 3, 0, Math.PI * 2);
       ctx.fill();
@@ -1855,7 +1924,7 @@ export class Timeline {
       ctx.fillRect(bx - 4, by - 9, tw + 8, 18);
       ctx.strokeStyle = "#3b4252";
       ctx.strokeRect(bx - 4, by - 9, tw + 8, 18);
-      ctx.fillStyle = this.tLong;
+      ctx.fillStyle = hoverColor;
       ctx.fillText(label, bx, by);
     }
   }
@@ -1949,7 +2018,7 @@ export class Timeline {
   private drawLag(cw: number) {
     const ctx = this.ctx;
     const top = RULER_H + CPU_H;
-    const plotTop = top + 16; // header row reserved at the band top
+    const plotTop = top + 20; // header row reserved at the band top (clears the CPU graph above)
     const plotBot = top + LAG_H; // sits exactly on the band's bottom divider
     const plotH = plotBot - plotTop;
     const yOf = (f: number) => plotBot - Math.min(1, Math.max(0, f)) * plotH;
@@ -1980,32 +2049,23 @@ export class Timeline {
     for (let x = 0; x < cw; x++) if (col[x] > peak) peak = col[x];
     const fullScale = Math.max(peak, LAG_MIN_FULL_MS_S);
 
-    // Baseline guide (0 lag) — on the band's bottom divider.
-    ctx.strokeStyle = "rgba(120,130,150,0.12)";
-    ctx.beginPath();
-    ctx.moveTo(0, plotBot + 0.5);
-    ctx.lineTo(cw, plotBot + 0.5);
-    ctx.stroke();
-
     if (n > 0) {
-      // Area.
-      ctx.beginPath();
-      ctx.moveTo(0, plotBot);
-      for (let x = 0; x < cw; x++) ctx.lineTo(x, yOf(col[x] / fullScale));
-      ctx.lineTo(cw, plotBot);
-      ctx.closePath();
-      ctx.fillStyle = this.rgba(this.tBlocked, 0.18); // red-ish: starvation
-      ctx.fill();
-      // Line.
-      ctx.beginPath();
-      for (let x = 0; x < cw; x++) {
-        const y = yOf(col[x] / fullScale);
-        if (x === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      }
-      ctx.strokeStyle = this.tBlocked;
-      ctx.lineWidth = 1;
-      ctx.stroke();
+      // Area + line, colored by stress level over a long gradient: neutral at the
+      // 0 baseline, warming to amber by 20 ms/s and red by 50 ms/s (then red on
+      // above). Keyed to height via the same auto-scale as the curve, so a
+      // contended stretch warms smoothly without striping.
+      const stops = [
+        { y: yOf(0), color: this.tBand }, // 0 → neutral
+        { y: yOf(LAG_WARN_MS_S / fullScale), color: this.tLong }, // 20 ms/s → amber
+        { y: yOf(Math.min(1, LAG_BAD_MS_S / fullScale)), color: this.tBlocked }, // 50 → red
+      ];
+      this.drawBandSeries(
+        cw,
+        (x) => yOf(col[x] / fullScale),
+        plotBot,
+        this.stressGradient(plotTop, plotBot, stops, 0.18),
+        this.stressGradient(plotTop, plotBot, stops, 1),
+      );
 
       // Full-scale marker: the band auto-scales, so label what its top now means.
       ctx.font = "9px ui-monospace, Menlo, monospace";
@@ -2014,9 +2074,13 @@ export class Timeline {
       ctx.textBaseline = "top";
       ctx.fillText(`${Math.round(fullScale)} ms/s`, AXIS_X, plotTop + 1);
     }
+    // No lag data (e.g. macOS, or a host without schedstat): draw nothing in the
+    // plot — the header shows "n/a" and the hover explains why, so a full-width
+    // line here would just read as a divider above the Hub track.
 
-    // Header row: label + latest rate.
-    const hy = top + 8;
+    // Header row: label + latest rate. Sat a few px below the CPU-band divider
+    // so the label isn't crammed against the graph above.
+    const hy = top + 11;
     ctx.font = "10px ui-monospace, Menlo, monospace";
     ctx.textBaseline = "middle";
     ctx.textAlign = "left";
@@ -2029,9 +2093,7 @@ export class Timeline {
       LAG_HELP,
     );
     ctx.font = "600 12px ui-monospace, Menlo, monospace";
-    // Severity: <5 healthy (neutral), 5–50 contention (amber), ≥50 serious (red).
-    ctx.fillStyle =
-      cur >= 50 ? this.tBlocked : cur >= 5 ? this.tLong : this.tMuted;
+    ctx.fillStyle = n > 0 ? this.lagTierColor(cur) : this.tMuted;
     ctx.textAlign = "right";
     ctx.fillText(n > 0 ? `${cur.toFixed(1)} ms/s` : "n/a", cw - 6, hy);
     ctx.textAlign = "left";
@@ -2046,7 +2108,8 @@ export class Timeline {
       const x = Math.max(0, Math.min(cw - 1, Math.round(this.mouseX)));
       const v = col[x];
       const y = yOf(v / fullScale);
-      ctx.fillStyle = this.tBlocked;
+      const dotColor = this.lagTierColor(v);
+      ctx.fillStyle = dotColor;
       ctx.beginPath();
       ctx.arc(x, y, 3, 0, Math.PI * 2);
       ctx.fill();
@@ -2061,7 +2124,28 @@ export class Timeline {
       ctx.fillRect(bx - 4, by - 9, tw + 8, 18);
       ctx.strokeStyle = "#3b4252";
       ctx.strokeRect(bx - 4, by - 9, tw + 8, 18);
-      ctx.fillStyle = this.tBlocked;
+      ctx.fillStyle = dotColor;
+      ctx.fillText(label, bx, by);
+    } else if (
+      n === 0 &&
+      this.mouseX >= 0 &&
+      this.mouseY >= top &&
+      this.mouseY < top + LAG_H
+    ) {
+      // No data here — explain why the band is empty rather than leaving the
+      // cursor over a blank strip.
+      const label = "n/a · scheduler lag unavailable (Linux-only)";
+      ctx.font = AXIS_FONT;
+      ctx.textBaseline = "middle";
+      const tw = ctx.measureText(label).width;
+      let bx = this.mouseX + 12;
+      if (bx + tw + 8 > cw) bx = this.mouseX - tw - 16;
+      const by = plotTop + plotH / 2;
+      ctx.fillStyle = "rgba(33,37,46,0.97)";
+      ctx.fillRect(bx - 4, by - 9, tw + 8, 18);
+      ctx.strokeStyle = "#3b4252";
+      ctx.strokeRect(bx - 4, by - 9, tw + 8, 18);
+      ctx.fillStyle = this.tMuted;
       ctx.fillText(label, bx, by);
     }
   }
@@ -2078,14 +2162,11 @@ export class Timeline {
     this.drawCpu(cw);
     this.drawLag(cw);
 
-    // Subtle dividers between ruler / CPU band / lag band / track area.
+    // Subtle dividers between ruler / CPU band / lag band. No divider below the
+    // lag band — the graphs flow into the track area (the Hub track) without a
+    // separating line.
     ctx.strokeStyle = "rgba(255,255,255,0.06)";
-    for (const y of [
-      RULER_H,
-      RULER_H + CPU_H,
-      RULER_H + CPU_H + LAG_H,
-      HEADER_H,
-    ]) {
+    for (const y of [RULER_H, RULER_H + CPU_H]) {
       ctx.beginPath();
       ctx.moveTo(0, y + 0.5);
       ctx.lineTo(cw, y + 0.5);

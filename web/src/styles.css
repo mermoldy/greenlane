@@ -36,7 +36,7 @@
   --ac-long: #ebcb8b; /* warn tier (amber) */
   --ac-blocked: #e8606b; /* block tier / error (red) */
   --ac-gc: #c8a0e6; /* GC markers (purple) */
-  --ac-cpu: #e8b563; /* CPU-band line (its own amber) */
+  --ac-band: #9aa3b2; /* CPU + scheduler-lag band line: neutral steel-gray, matched to the timeline grid so the system bands read as part of the grid, not as colored data */
 }
 * {
   box-sizing: border-box;
