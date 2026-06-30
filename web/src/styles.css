@@ -143,6 +143,11 @@ body {
 .topbar button {
   white-space: nowrap;
 }
+/* Right-group buttons (follow / detach …) match the metric-chip height so the
+   header row aligns cleanly. */
+.topbar .right button {
+  height: 30px;
+}
 .topbar .title {
   font-weight: 600;
   color: var(--ac-green);
@@ -188,6 +193,79 @@ body {
 }
 .dot.file {
   background: var(--ac-cyan);
+}
+/* Header metric chips: one bordered strip of label/value pairs (replaces the
+   run-on stat string). Each chip stacks a small uppercase label over its value;
+   1px dividers separate them. Hub-lag is health-tinted so it reads as a gauge. */
+.statchips {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: stretch;
+  height: 30px;
+  border: 1px solid var(--bd);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg-inset);
+}
+.statchips .chip {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1px;
+  padding: 0 11px;
+  white-space: nowrap;
+}
+.statchips .chip-l {
+  color: var(--tx-faint);
+  font-size: 8.5px;
+  letter-spacing: 0.6px;
+}
+.statchips .chip-v {
+  color: var(--tx-2);
+  font-size: 11px;
+  font-weight: 600;
+  /* Equal-width digits + a reserved min-width per chip (below) so a changing
+     value never reflows the strip or shifts neighbouring chips. */
+  font-variant-numeric: tabular-nums;
+  display: inline-block;
+}
+.statchips .ch-exec .chip-v {
+  min-width: 152px;
+}
+.statchips .ch-buf .chip-v {
+  min-width: 112px;
+}
+.statchips .ch-rate .chip-v {
+  min-width: 52px;
+}
+.statchips .ch-gc .chip-v {
+  min-width: 56px;
+}
+.statchips .ch-lag .chip-v {
+  min-width: 56px;
+}
+.statchips .chip-u {
+  color: var(--tx-faint);
+  font-weight: 400;
+}
+.statchips .chipdiv {
+  width: 1px;
+  background: var(--bd-soft);
+}
+.statchips .chip.gc .chip-v {
+  color: var(--ac-gc);
+}
+.statchips .chip.warnish {
+  background: rgba(235, 203, 139, 0.08);
+}
+.statchips .chip.warnish .chip-v {
+  color: var(--ac-long);
+}
+.statchips .chip.danger {
+  background: rgba(232, 96, 107, 0.1);
+}
+.statchips .chip.danger .chip-v {
+  color: var(--ac-blocked);
 }
 button {
   display: inline-flex;
@@ -277,8 +355,8 @@ button.danger:hover:not(:disabled) {
    beside a separately-bordered select. The label becomes the box; the select
    goes transparent and borderless within it. */
 .bottombar .ctl {
-  gap: 5px;
-  padding: 2px 6px;
+  gap: 4px;
+  padding: 2px 5px;
   background: var(--bd);
   border: 1px solid var(--bd-strong);
   border-radius: 5px;
@@ -297,8 +375,8 @@ button.danger:hover:not(:disabled) {
   flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
-  gap: 6px 14px;
-  padding: 5px 14px;
+  gap: 6px 10px;
+  padding: 5px 10px;
   background: var(--bg-panel);
   border-top: 1px solid var(--bd-soft);
   font-size: 12px;
@@ -312,10 +390,10 @@ button.danger:hover:not(:disabled) {
   align-items: center;
   flex-wrap: nowrap; /* stay one line; only the two GROUPS stack (bar wraps), never items within a group */
   min-width: 0;
-  gap: 6px 14px;
+  gap: 5px 7px;
 }
 .bottombar .slowtoggle {
-  padding: 2px 9px;
+  padding: 2px 7px;
   font-size: 12px;
 }
 /* Per-tier count pills on the slow-log toggle: amber = warn band, red = block
@@ -352,6 +430,14 @@ button.danger:hover:not(:disabled) {
   width: 1px;
   height: 18px;
   background: var(--bd);
+}
+/* Small uppercase group label that heads a cluster of bottom-bar controls. */
+.bottombar .bbgroup {
+  flex: none;
+  font-size: 8.5px;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--tx-faint);
 }
 .bottombar .help {
   padding: 3px 7px;
@@ -458,18 +544,40 @@ button.danger:hover:not(:disabled) {
   overflow-y: auto;
   font-size: 12px;
 }
+/* Fixed-column grid shared by the sticky header and every row, so columns line
+   up regardless of content. The function column flexes; the rest are fixed. */
+.slowhead,
 .slowrow {
-  display: flex;
+  display: grid;
+  grid-template-columns: 8px 104px 150px minmax(0, 1fr) 120px;
   align-items: center;
   gap: 10px;
   padding: 3px 12px;
+}
+.slowhead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  font-size: 9px;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--tx-faint);
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--bd);
+  cursor: default;
+}
+.slowrow {
   cursor: pointer;
   border-bottom: 1px solid var(--bd-row);
 }
 .slowrow:hover {
   background: var(--bg-hover);
 }
+/* Loading / empty placeholders span the whole width, centered. */
 .slowrow.muted {
+  display: block;
+  text-align: center;
+  padding: 6px 12px;
   color: var(--tx-faint);
   cursor: default;
 }
@@ -495,14 +603,15 @@ button.danger:hover:not(:disabled) {
   flex: none;
 }
 .slowrow .sdur {
-  min-width: 72px;
+  font-variant-numeric: tabular-nums;
 }
 .slowrow .snm {
-  min-width: 110px;
   color: var(--tx-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .slowrow .sfn {
-  flex: 1;
   color: var(--tx-muted);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -510,6 +619,7 @@ button.danger:hover:not(:disabled) {
 }
 .slowrow .sat {
   color: var(--tx-faint);
+  font-variant-numeric: tabular-nums;
 }
 .bottombar .hints {
   white-space: nowrap;
@@ -521,7 +631,7 @@ button.danger:hover:not(:disabled) {
   align-items: center;
   flex-wrap: nowrap; /* one line; the zoom slider shrinks (below) so it fits a wide range */
   min-width: 0;
-  gap: 6px 14px;
+  gap: 5px 8px;
 }
 .bottombar .zoom {
   display: flex;
@@ -704,6 +814,30 @@ canvas.overlay {
   overflow: hidden;
   font-size: 11px;
   color: var(--tx-2);
+}
+/* Always-on color legend in the header (span fill key for duration/heatmap).
+   margin-left:auto pushes it — and the right-hand button group after it — to the
+   right edge. */
+.topbar .legend {
+  flex: 0 0 auto;
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 9.5px;
+  color: var(--tx-muted);
+  white-space: nowrap;
+}
+.topbar .legend .lg {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: default;
+}
+.topbar .legend .sw {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
 }
 .tracklabel {
   position: absolute;

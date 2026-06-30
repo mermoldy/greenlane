@@ -493,30 +493,49 @@ async fn client(mut socket: WebSocket, st: AppState) {
     let mut last_stalled = false; // last `stalled` flag pushed in a head
     let mut tick = tokio::time::interval(HEAD_TICK);
 
+    // Decouple query execution from this connection's recv loop: each request is
+    // handled in its own task and its reply comes back over this channel, which the
+    // loop drains to the socket. Without this, one slow query (e.g. an O(total)
+    // slow-log scan) blocks the loop — stalling viewport replies AND live `head`
+    // pushes — so the timeline freezes on every slow-log poll. Bounded so a slow
+    // client applies backpressure to the handler tasks rather than unbounded queueing.
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<Message>(64);
+
     loop {
         tokio::select! {
             inbound = socket.recv() => {
                 match inbound {
                     // The viewer drives data flow with viewport/slowlog/stats requests.
+                    // Handle each OFF the loop so a slow query can't head-of-line-block
+                    // viewport replies or live heads on this connection.
                     Some(Ok(Message::Text(t))) => {
-                        let started = Instant::now();
-                        let reply = handle_request(&st, &t).await;
-                        // One per viewport/slowlog/stats request — fires on every
-                        // pan/zoom, so trace, not debug.
-                        tracing::trace!(
-                            req = %t.chars().take(80).collect::<String>(),
-                            elapsed_ms = started.elapsed().as_secs_f64() * 1e3,
-                            replied = reply.is_some(),
-                            "served viewer request"
-                        );
-                        if let Some(reply) = reply
-                            && socket.send(reply).await.is_err()
-                        {
-                            break;
-                        }
+                        let st = st.clone();
+                        let tx = reply_tx.clone();
+                        tokio::spawn(async move {
+                            let started = Instant::now();
+                            let reply = handle_request(&st, &t).await;
+                            // One per viewport/slowlog/stats request — fires on every
+                            // pan/zoom, so trace, not debug.
+                            tracing::trace!(
+                                req = %t.chars().take(80).collect::<String>(),
+                                elapsed_ms = started.elapsed().as_secs_f64() * 1e3,
+                                replied = reply.is_some(),
+                                "served viewer request"
+                            );
+                            if let Some(reply) = reply {
+                                let _ = tx.send(reply).await;
+                            }
+                        });
                     }
                     Some(Ok(_)) => {} // ping/pong/binary — ignore
                     _ => break,        // closed or error
+                }
+            }
+            // Drain handler-task replies to the socket. The socket is touched only by
+            // this loop (one select arm at a time), so no split/lock is needed.
+            Some(reply) = reply_rx.recv() => {
+                if socket.send(reply).await.is_err() {
+                    break;
                 }
             }
             _ = tick.tick() => {

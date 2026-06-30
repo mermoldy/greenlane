@@ -715,62 +715,70 @@ function App() {
             <span>· {formatBytes(source.bytes)}</span>
           </span>
         )}
-        <span
-          className="stat"
-          title={`${total.toLocaleString()} executions (${formatBytes(dataBytes)}) collected across the whole capture; ${bufCount.toLocaleString()} (${formatBytes(viewBytes)}) held in the viewer for the visible window (plus a small pan margin). The buffered set is bounded — only the window is fetched, not the whole capture — so it stays flat as the capture grows; ⚠ capped means it hit the render cap, so zoom in for full detail. Each execution is one continuous task or greenlet run.`}
-        >
-          {total.toLocaleString()} executions ({formatBytes(dataBytes)})
-          <span className="sub">
-            {" "}
-            · in view {bufCount.toLocaleString()} ({formatBytes(viewBytes)})
-          </span>
-        </span>
-        <span
-          className="stat"
-          title="Mean scheduler events per second over the captured time span."
-        >
-          {formatRate(rate)}
-        </span>
-        <span
-          className="stat"
-          title="Number of greenlets discovered in the trace."
-        >
-          {tracks} greenlets
-        </span>
-        <span
-          className="stat gc"
-          title="Garbage-collection pauses captured as global timeline markers. Toggle the markers with the GC button in the bottom bar."
-        >
-          {gc.toLocaleString()} GC
-        </span>
-        {live && (
+        <span className="statchips">
           <span
-            className="stat"
-            title={
-              lag >= 5000
-                ? "⚠ Arrival lag is high: the newest rendered execution trails real time by several seconds — the viewer can't keep up with the capture+transport rate (try a narrower view, or check the connection)."
-                : "Arrival lag: how far the newest rendered execution trails real time (capture + transport delay). The live edge moves on the wall clock; executions fill in behind it."
-            }
-            style={
-              lag >= 5000
-                ? { color: "var(--ac-blocked)" } // red: seriously behind
-                : lag >= 1000
-                  ? { color: "var(--ac-long)" } // amber: starting to trail
-                  : undefined // normal
-            }
+            className="chip ch-exec"
+            title={`${total.toLocaleString()} executions (${formatBytes(dataBytes)}) collected across the whole capture. Each execution is one continuous task or greenlet run.`}
           >
-            {lag >= 5000 ? "⚠ " : ""}lag {formatTime(lag)}
+            <span className="chip-l">EXECUTIONS</span>
+            <span className="chip-v">
+              {total.toLocaleString()}
+              <span className="chip-u"> · {formatBytes(dataBytes)}</span>
+            </span>
           </span>
-        )}
-        {capped && (
+          <span className="chipdiv" aria-hidden="true" />
           <span
-            className="stat"
-            title="The visible range has more executions than the render cap; zoom in to see them all."
-            style={{ color: "var(--ac-long)" }}
+            className={`chip ch-buf${capped ? " warnish" : ""}`}
+            title={`${bufCount.toLocaleString()} executions (${formatBytes(viewBytes)}) held in the viewer for the visible window (plus a small pan margin). The buffered set is bounded — only the window is fetched, not the whole capture — so it stays flat as the capture grows.${capped ? " ⚠ capped: the visible range has more executions than the render cap; zoom in to see them all." : ""}`}
           >
-            ⚠ capped
+            <span className="chip-l">BUFFER</span>
+            <span className="chip-v">
+              {capped ? "⚠ " : ""}
+              {bufCount.toLocaleString()}
+              <span className="chip-u"> · {formatBytes(viewBytes)}</span>
+            </span>
           </span>
-        )}
+          <span className="chipdiv" aria-hidden="true" />
+          <span
+            className="chip ch-rate"
+            title="Mean scheduler events per second over the captured time span."
+          >
+            <span className="chip-l">RATE</span>
+            <span className="chip-v">{formatRate(rate)}</span>
+          </span>
+          <span className="chipdiv" aria-hidden="true" />
+          <span
+            className="chip ch-gl"
+            title="Number of greenlets discovered in the trace."
+          >
+            <span className="chip-l">GREENLETS</span>
+            <span className="chip-v">{tracks.toLocaleString()}</span>
+          </span>
+          <span className="chipdiv" aria-hidden="true" />
+          <span
+            className="chip gc ch-gc"
+            title="Garbage-collection pauses captured as global timeline markers. Toggle the markers with the GC button in the bottom bar."
+          >
+            <span className="chip-l">GC</span>
+            <span className="chip-v">{gc.toLocaleString()}</span>
+          </span>
+          {live && (
+            <>
+              <span className="chipdiv" aria-hidden="true" />
+              <span
+                className={`chip lag ch-lag${lag >= 5000 ? " danger" : lag >= 1000 ? " warnish" : ""}`}
+                title={
+                  lag >= 5000
+                    ? "⚠ Arrival lag is high: the newest rendered execution trails real time by several seconds — the viewer can't keep up with the capture+transport rate (try a narrower view, or check the connection)."
+                    : "Arrival lag: how far the newest rendered execution trails real time (capture + transport delay). The live edge moves on the wall clock; executions fill in behind it."
+                }
+              >
+                <span className="chip-l">LAG</span>
+                <span className="chip-v">{formatTime(lag)}</span>
+              </span>
+            </>
+          )}
+        </span>
         {evictedFromNs > 0 && (
           <span
             className="stat"
@@ -780,6 +788,38 @@ function App() {
             ⚠ old data evicted
           </span>
         )}
+        <div
+          className="legend"
+          title="Span fill colors in duration / heatmap mode."
+        >
+          <span
+            className="lg"
+            title="Ran shorter than the long threshold — healthy."
+          >
+            <span className="sw" style={{ background: "#5c9eeb" }} /> running
+          </span>
+          <span
+            className="lg"
+            title={`Ran past the long threshold (≥ ${longMs}ms) — getting long.`}
+          >
+            <span className="sw" style={{ background: "var(--ac-long)" }} />{" "}
+            long
+          </span>
+          <span
+            className="lg"
+            title={`Ran past the blocked threshold (≥ ${blockedMs}ms) — long enough to stall the scheduler.`}
+          >
+            <span className="sw" style={{ background: "var(--ac-blocked)" }} />{" "}
+            blocked
+          </span>
+          <span
+            className="lg"
+            title="The gevent hub — the scheduler greenlet itself."
+          >
+            <span className="sw" style={{ background: "var(--ac-green)" }} />{" "}
+            hub
+          </span>
+        </div>
         <div className="right">
           <button
             className="danger"
@@ -898,6 +938,7 @@ function App() {
             {slowOpen ? "▾" : "▸"}
           </button>
           <span className="bbsep" aria-hidden="true" />
+          <span className="bbgroup">sort by</span>
           <label className="ctl ctlsort" title={sortTitle(sort)}>
             <IconSort />
             <select
@@ -939,6 +980,8 @@ function App() {
               </option>
             </select>
           </label>
+          <span className="bbsep" aria-hidden="true" />
+          <span className="bbgroup">display</span>
           <label
             className="ctl"
             title="Greenlet fill color: by greenlet identity, by execution duration (blue < long, yellow < blocked, red beyond), or as a heatmap (continuous blue→yellow→red gradient by run length, anchored to the long/blocked thresholds). Hub stays green."
@@ -1357,6 +1400,13 @@ function SlowLog({
         </button>
       </div>
       <div className="slowlog-body">
+        <div className="slowhead">
+          <span />
+          <span className="sdur">duration</span>
+          <span className="snm">greenlet</span>
+          <span className="sfn">function</span>
+          <span className="sat">at</span>
+        </div>
         {loading ? (
           // Mask the stale rows while a fresh query (level/sort switch) runs — on a
           // large log the swap is otherwise a visible lag with old rows lingering.
