@@ -1,6 +1,6 @@
 [package]
 name = "greenlane"
-version = "0.1.0"
+version = "0.0.5"
 edition = "2024"
 description = "A microscope for gevent applications: a live timeline profiler that attaches to a running Python process and visualizes scheduler activity, GC pauses, and call stacks."
 authors = ["Serhii Babak"]
@@ -27,8 +27,6 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 ctrlc = "3"
 libc = "0.2"
-# Pure-Rust DEFLATE backend (miniz_oxide) — no C dep, links cleanly with musl —
-# for compressing sealed .glr segments (R7).
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
 axum = { version = "0.8", features = ["ws"] }

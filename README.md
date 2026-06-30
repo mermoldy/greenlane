@@ -198,3 +198,18 @@ Useful flags:
 - `--python <bin>` — helper interpreter that drives `sys.remote_exec` (3.14+).
 - `--out <path>` — where to save the recording.
 - `--log-format <text|json>` and `RUST_LOG` — diagnostics (all go to stderr).
+- `--version` — print the build version (matches the GitHub release tag).
+
+## Releasing
+
+`Cargo.toml` is the single source of truth for the version, and `greenlane
+--version` reports it (`CARGO_PKG_VERSION`). To cut a release:
+
+1. Bump `version` in `Cargo.toml` and commit.
+2. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z` (the tag must be
+   `v` + the `Cargo.toml` version).
+
+The push triggers the release workflow, which first verifies the tag matches
+`Cargo.toml` (the build fails otherwise), then builds and publishes the
+artifacts. This guarantees the binary's `--version` always equals the release
+tag.

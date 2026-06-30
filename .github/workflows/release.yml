@@ -19,9 +19,34 @@ env:
   BIN_NAME: greenlane
 
 jobs:
+  verify-version:
+    name: Verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Check version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          cargo_version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          expected="v${cargo_version}"
+          if [ "$RELEASE_TAG" != "$expected" ]; then
+            echo "::error::Release tag $RELEASE_TAG does not match Cargo.toml version ($expected)." \
+                 "Bump version in Cargo.toml to match the tag (or retag), then re-run." >&2
+            exit 1
+          fi
+          echo "Tag $RELEASE_TAG matches Cargo.toml ($expected)."
+
   build:
     name: Build ${{ matrix.artifact }}
     runs-on: ${{ matrix.os }}
+    needs: verify-version
 
     strategy:
       fail-fast: false

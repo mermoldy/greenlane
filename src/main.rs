@@ -47,24 +47,25 @@ const GLR_ENCODER: &str = include_str!("glr.py");
 #[derive(Parser)]
 #[command(
     name = "greenlane",
+    version,
     about = "Attach to a running gevent process and profile scheduler activity"
 )]
 struct Cli {
-    /// Log output format. `text` is human-readable; `json` emits one JSON
+    /// Log output format. text is human-readable; json emits one JSON
     /// object per line for ingestion by a log pipeline.
     #[arg(long, value_enum, default_value_t = LogFormat::Text, global = true)]
     log_format: LogFormat,
     /// Verbose debug logging: per-batch streaming, DB reads/writes, the inject
-    /// handshake, and other internals. Equivalent to `RUST_LOG=info,greenlane=debug`
-    /// (an explicit `RUST_LOG` still wins if set).
+    /// handshake, and other internals. Equivalent to RUST_LOG=info,greenlane=debug
+    /// (an explicit RUST_LOG still wins if set).
     #[arg(long, global = true)]
     debug: bool,
     /// "Long" threshold (ms): executions at least this long are highlighted yellow and
-    /// listed in the slow log. Also via `GREENLANE_LONG_MS`.
+    /// listed in the slow log. Also via GREENLANE_LONG_MS.
     #[arg(long, env = "GREENLANE_LONG_MS", default_value_t = 20, global = true)]
     long_ms: u64,
     /// "Blocked" threshold (ms): executions at least this long are highlighted red — long
-    /// enough to stall the scheduler. Also via `GREENLANE_BLOCKED_MS`.
+    /// enough to stall the scheduler. Also via GREENLANE_BLOCKED_MS.
     #[arg(
         long,
         env = "GREENLANE_BLOCKED_MS",
@@ -133,7 +134,7 @@ impl TraceMode {
 enum AnalyzeFormat {
     /// Human-readable report (default).
     Text,
-    /// One JSON object, for piping into `jq` / CI.
+    /// One JSON object, for piping into jq / CI.
     Json,
 }
 
@@ -178,13 +179,13 @@ fn init_logging(format: LogFormat, debug: bool) {
 enum Cmd {
     /// Attach to a running gevent process by PID and record its timeline.
     ///
-    /// By default the timeline is written to a `.glr` file (open it later with
-    /// `greenlane open`). Pass `--serve` to watch it live in the browser; pass
+    /// By default the timeline is written to a .glr file (open it later with
+    /// greenlane open). Pass --serve to watch it live in the browser; pass
     /// both to watch live *and* save the session on exit.
     Attach {
         /// Target process PID.
         pid: i32,
-        /// Python interpreter used to trigger `sys.remote_exec` (must be 3.14+).
+        /// Python interpreter used to trigger sys.remote_exec (must be 3.14+).
         #[arg(long, default_value = "python3")]
         python: String,
         /// Skip sys.remote_exec; just listen and print the bootstrap to load
@@ -192,12 +193,12 @@ enum Cmd {
         /// task-port restrictions) and you self-instrument your app instead.
         #[arg(long)]
         no_inject: bool,
-        /// Full call-stack capture mode: `off`, `slow` (default), or `all`.
+        /// Full call-stack capture mode: off, slow (default), or all.
         /// Walking the Python stack is the hot-path cost, so it's gated to a execution's
-        /// close (when its duration is known): `slow` walks only executions at/over the
-        /// long threshold (`--long-ms`) — the ones worth investigating — `all`
-        /// walks every execution, `off` keeps only the cheap leaf label. Bare
-        /// `--include-traces` means `slow`. Every execution always carries its cheap
+        /// close (when its duration is known): slow walks only executions at/over the
+        /// long threshold (--long-ms) — the ones worth investigating — all
+        /// walks every execution, off keeps only the cheap leaf label. Bare
+        /// --include-traces means slow. Every execution always carries its cheap
         /// leaf-function label regardless.
         #[arg(
             long,
@@ -207,9 +208,9 @@ enum Cmd {
             default_missing_value = "slow",
         )]
         include_traces: TraceMode,
-        /// Serve the live web viewer. Pass bare (`--serve` → `127.0.0.1:8080`),
-        /// a port (`--serve 9000` / `--serve :9000`), or a full address
-        /// (`--serve 0.0.0.0:8080` to expose on the network). Omit entirely to
+        /// Serve the live web viewer. Pass bare (--serve → 127.0.0.1:8080),
+        /// a port (--serve 9000 / --serve :9000), or a full address
+        /// (--serve 0.0.0.0:8080 to expose on the network). Omit entirely to
         /// record to a file instead.
         #[arg(
             long,
@@ -218,8 +219,8 @@ enum Cmd {
             value_parser = parse_listen_addr,
         )]
         serve: Option<SocketAddr>,
-        /// Write the recording to this path. Defaults to `greenlane-<pid>.glr`
-        /// when not serving; ignored-unless-set when `--serve` is given (in
+        /// Write the recording to this path. Defaults to greenlane-<pid>.glr
+        /// when not serving; ignored-unless-set when --serve is given (in
         /// which case it also saves the live session to the file on exit).
         #[arg(long)]
         out: Option<PathBuf>,
@@ -228,38 +229,38 @@ enum Cmd {
         #[arg(long)]
         web_dir: Option<PathBuf>,
         /// Disable the viewer's session-token auth. By default greenlane gates
-        /// `/ws` and `/detach` on the token in the printed capability
-        /// URL; with `--no-auth` the bare URL works and anyone who can reach the
+        /// /ws and /detach on the token in the printed capability
+        /// URL; with --no-auth the bare URL works and anyone who can reach the
         /// port has full access. Use only on a trusted, local-only bind.
         #[arg(long)]
         no_auth: bool,
     },
 
-    /// Open a recorded `.glr` timeline in the web viewer (static, not live).
+    /// Open a recorded .glr timeline in the web viewer (static, not live).
     Open {
-        /// Path to a `.glr` file written by `greenlane attach`.
+        /// Path to a .glr file written by greenlane attach.
         file: PathBuf,
-        /// Address to serve the viewer at. Accepts a port, `:port`, or a full
-        /// `host:port` (see `attach --serve`).
+        /// Address to serve the viewer at. Accepts a port, :port, or a full
+        /// host:port (see attach --serve).
         #[arg(long, default_value = "127.0.0.1:8080", value_parser = parse_listen_addr)]
         serve: SocketAddr,
         /// Serve viewer assets from this directory instead of the embedded ones.
         #[arg(long)]
         web_dir: Option<PathBuf>,
-        /// Disable the viewer's session-token auth (see `attach --no-auth`).
+        /// Disable the viewer's session-token auth (see attach --no-auth).
         #[arg(long)]
         no_auth: bool,
     },
 
-    /// Analyze a recorded `.glr` timeline and print a headless report — no browser.
+    /// Analyze a recorded .glr timeline and print a headless report — no browser.
     ///
     /// Loads the recording into the same store the viewer uses and runs the same
     /// queries (top stalls, GC pressure, greenlet imbalance, hottest functions), then
     /// prints the result as text or JSON. Useful in CI or for quick triage over SSH.
     Analyze {
-        /// Path to a `.glr` file written by `greenlane attach`.
+        /// Path to a .glr file written by greenlane attach.
         file: PathBuf,
-        /// Output format: `text` (default, human-readable) or `json`.
+        /// Output format: text (default, human-readable) or json.
         #[arg(long, value_enum, default_value_t = AnalyzeFormat::Text)]
         format: AnalyzeFormat,
         /// How many rows to show in the ranked lists (slowest executions, top greenlets,
@@ -520,7 +521,7 @@ fn ensure_pid_exists(pid: i32) -> Result<()> {
     match err.raw_os_error() {
         Some(libc::ESRCH) => bail!(
             "No process with PID {pid} is running.\n\
-             Check the PID with `ps -p {pid}` or `pgrep -fl python`, then retry\n\
+             Check the PID with: ps -p {pid}   (or: pgrep -fl python), then retry\n\
              with the correct process id."
         ),
         // Process exists but we can't signal it — that's a privilege issue, not
@@ -583,15 +584,15 @@ fn diagnose_inject_failure(pid: i32, exit: Option<i32>, stderr: &str) -> String 
     let hint = if is_too_old {
         "\nCause: the target (or the helper interpreter) is older than Python 3.14.\n\
          sys.remote_exec / PEP 768 remote debugging requires CPython 3.14+ on both\n\
-         the target process and the `--python` helper greenlane shells out to.\n\
+         the target process and the --python helper greenlane shells out to.\n\
          Fix: run the target under Python 3.14+, or point greenlane at a 3.14+\n\
-         interpreter with `--python /path/to/python3.14`."
+         interpreter with --python /path/to/python3.14."
             .to_string()
     } else if is_disabled {
         "\nCause: remote debugging is turned off in the target interpreter.\n\
-         Fix: ensure the target was NOT started with `-X disable_remote_debug` and\n\
-         that `PYTHON_DISABLE_REMOTE_DEBUG` is unset in its environment. Also confirm\n\
-         CPython wasn't built with `--without-remote-debug`."
+         Fix: ensure the target was NOT started with -X disable_remote_debug and\n\
+         that PYTHON_DISABLE_REMOTE_DEBUG is unset in its environment. Also confirm\n\
+         CPython wasn't built with --without-remote-debug."
             .to_string()
     } else if is_perm {
         format!(
@@ -642,7 +643,7 @@ The simplest fix is to run greenlane with sudo:
     sudo greenlane attach <PID> ...
 
 To avoid sudo on every run, the greenlane binary can carry the
-`com.apple.system-task-ports` entitlement and be code-signed. For local
+com.apple.system-task-ports entitlement and be code-signed. For local
 development you can self-sign it:
 
     cat > gl.entitlements <<'EOF'
@@ -655,7 +656,7 @@ development you can self-sign it:
     EOF
     codesign -s - -f --entitlements gl.entitlements ./target/debug/greenlane
 
-Note: `com.apple.system-task-ports` is an Apple-private entitlement, so on a
+Note: com.apple.system-task-ports is an Apple-private entitlement, so on a
 stock (SIP-enabled) machine a self-signed binary may still be denied; running
 under sudo is the reliable path. The target must also be owned by the same
 user as greenlane (or run greenlane as that user / root)."#;
